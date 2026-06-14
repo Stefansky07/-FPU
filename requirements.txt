@@ -1,0 +1,11 @@
+# Core dependencies
+torch>=2.0
+triton>=2.0
+
+# Optional dependencies for hefl_runtime integration
+psutil
+numpy
+matplotlib
+
+# Development dependencies
+pytest

@@ -1,0 +1,66 @@
+{
+  "description": "Benchmark configuration for FPU operator",
+  "models": {
+    "tiny_cnn": {
+      "params": 136874,
+      "description": "Small CNN for CIFAR-10"
+    },
+    "tiny_mlp": {
+      "params": 54090,
+      "description": "Small MLP for MNIST"
+    },
+    "resnet18": {
+      "params": 88522,
+      "description": "Simplified ResNet-18-like structure (subset of layers for testing)"
+    }
+  },
+  "crypto": {
+    "scheme": "CKKS",
+    "poly_modulus_degree": 8192,
+    "slots": 4096,
+    "coeff_mod_bit_sizes": [60, 40, 40, 60],
+    "scale_bits": 40
+  },
+  "configs": [
+    {
+      "name": "baseline",
+      "clip_norm": 1.0,
+      "noise_multiplier": 0.0,
+      "quant_bits": 0,
+      "client_weight": 1.0
+    },
+    {
+      "name": "dp_light",
+      "clip_norm": 1.0,
+      "noise_multiplier": 0.1,
+      "quant_bits": 0,
+      "client_weight": 1.0
+    },
+    {
+      "name": "dp_heavy",
+      "clip_norm": 0.5,
+      "noise_multiplier": 1.0,
+      "quant_bits": 0,
+      "client_weight": 1.0
+    },
+    {
+      "name": "quantized",
+      "clip_norm": 1.0,
+      "noise_multiplier": 0.0,
+      "quant_bits": 8,
+      "client_weight": 1.0
+    },
+    {
+      "name": "full_pipeline",
+      "clip_norm": 1.0,
+      "noise_multiplier": 0.1,
+      "quant_bits": 8,
+      "client_weight": 1.0
+    }
+  ],
+  "benchmark": {
+    "num_warmup": 10,
+    "num_iterations": 100,
+    "backends": ["triton", "torch_ref"]
+  }
+}
