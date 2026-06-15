@@ -13,7 +13,9 @@ This kernel fuses multiple operations into a single GPU pass:
 from __future__ import annotations
 
 import math
+import json
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -175,11 +177,15 @@ def _abs_max_transform_partial_kernel(
     x_ptr,
     noise_ptr,
     partial_max_ptr,
+    base_offset,
     n_elements,
+    total_params,
     clip_scale,
     client_weight,
     noise_std,
     USE_NOISE: tl.constexpr,
+    USE_STATELESS_NOISE: tl.constexpr,
+    NOISE_SEED: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -187,14 +193,19 @@ def _abs_max_transform_partial_kernel(
     the transformed vector.
     """
     pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
+    block_start = base_offset + pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
-    mask = offsets < n_elements
+    end_offset = base_offset + n_elements
+    mask = (offsets < end_offset) & (offsets < total_params)
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     x = x * (clip_scale * client_weight)
     if USE_NOISE:
-        noise = tl.load(noise_ptr + offsets, mask=mask, other=0.0)
+        if USE_STATELESS_NOISE:
+            noise = tl.randn(NOISE_SEED, offsets)
+            noise = tl.where(mask, noise, 0.0)
+        else:
+            noise = tl.load(noise_ptr + offsets, mask=mask, other=0.0)
         x = x + noise * noise_std
 
     block_max = tl.max(tl.abs(x), axis=0)
@@ -299,6 +310,25 @@ def _add_noise_kernel(
     tl.store(out_ptr + offsets, out, mask=mask)
 
 
+@triton.jit
+def _stateless_noise_kernel(
+    noise_ptr,
+    n_elements,
+    seed: tl.constexpr,
+    base_offset,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Materialize tl.randn(seed, global_offset) for validation/reference only."""
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = base_offset + pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    local_offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = local_offsets < n_elements
+
+    noise = tl.randn(seed, offsets)
+    tl.store(noise_ptr + local_offsets, noise, mask=mask)
+
+
 # ============================================================================
 # Triton Kernel: Quantize (fix #4 — added scale/inv_scale params)
 # ============================================================================
@@ -397,6 +427,7 @@ def _fused_update_kernel(
     clip_scale,
     client_weight,
     noise_std,
+    noise_seed,
     # Quantization params (pre-computed on host)
     quant_inv_scale,
     quant_scale,
@@ -407,7 +438,10 @@ def _fused_update_kernel(
     num_params,
     total_slots,
     slot_capacity,
+    base_offset,
     # Kernel config
+    USE_STATELESS_NOISE: tl.constexpr,
+    STORE_LOCAL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -424,7 +458,7 @@ def _fused_update_kernel(
     4. packed[bundle_id, slot_offset] = x
     """
     pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
+    block_start = base_offset + pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     param_mask = offsets < num_params
@@ -441,7 +475,11 @@ def _fused_update_kernel(
 
     # Add noise if enabled
     if noise_std > 0:
-        noise = tl.load(noise_ptr + safe_offsets, mask=param_mask, other=0.0)
+        if USE_STATELESS_NOISE:
+            noise = tl.randn(noise_seed, offsets)
+            noise = tl.where(param_mask, noise, 0.0)
+        else:
+            noise = tl.load(noise_ptr + safe_offsets, mask=param_mask, other=0.0)
         x = x + noise * noise_std
 
     # Quantize if enabled
@@ -454,6 +492,8 @@ def _fused_update_kernel(
     bundle_ids = offsets // slot_capacity
     slot_offsets = offsets % slot_capacity
     dest = bundle_ids * slot_capacity + slot_offsets
+    if STORE_LOCAL:
+        dest = offsets - base_offset
 
     # Store to packed buffer
     tl.store(packed_ptr + dest, x, mask=store_mask)
@@ -472,13 +512,17 @@ def _fused_update_int8_kernel(
     noise_std,
     # Quantization params
     quant_inv_scale,
+    noise_seed,
     qmin,
     qmax,
     # Dimensions
     num_params,
     total_slots,
     slot_capacity,
+    base_offset,
     # Kernel config
+    USE_STATELESS_NOISE: tl.constexpr,
+    STORE_LOCAL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -488,7 +532,7 @@ def _fused_update_int8_kernel(
     directly. Padding slots are written as zero.
     """
     pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
+    block_start = base_offset + pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     param_mask = offsets < num_params
@@ -499,7 +543,11 @@ def _fused_update_int8_kernel(
     x = x * (clip_scale * client_weight)
 
     if noise_std > 0:
-        noise = tl.load(noise_ptr + safe_offsets, mask=param_mask, other=0.0)
+        if USE_STATELESS_NOISE:
+            noise = tl.randn(noise_seed, offsets)
+            noise = tl.where(param_mask, noise, 0.0)
+        else:
+            noise = tl.load(noise_ptr + safe_offsets, mask=param_mask, other=0.0)
         x = x + noise * noise_std
 
     scaled = x * quant_inv_scale
@@ -509,6 +557,8 @@ def _fused_update_int8_kernel(
     bundle_ids = offsets // slot_capacity
     slot_offsets = offsets % slot_capacity
     dest = bundle_ids * slot_capacity + slot_offsets
+    if STORE_LOCAL:
+        dest = offsets - base_offset
 
     # Cast to physical int8 for compressed output
     quantized_i8 = quantized.to(tl.int8)
@@ -656,6 +706,9 @@ def compute_transformed_abs_max_triton(
     clip_scale: float,
     client_weight: float,
     noise_std: float,
+    base_offset: int = 0,
+    stateless_noise: bool = False,
+    noise_seed: int = 0,
 ) -> float:
     """
     Compute max(abs(flat * clip_scale * client_weight + noise * noise_std)).
@@ -665,11 +718,18 @@ def compute_transformed_abs_max_triton(
     """
     if n_elements == 0:
         return 0.0
-    if n_elements > flat.numel():
-        raise ValueError(f"n_elements={n_elements} exceeds flat.numel()={flat.numel()}")
+    if base_offset < 0:
+        raise ValueError(f"base_offset must be non-negative, got {base_offset}")
+    if base_offset + n_elements > flat.numel():
+        raise ValueError(
+            f"base_offset + n_elements={base_offset + n_elements} "
+            f"exceeds flat.numel()={flat.numel()}"
+        )
     use_noise = noise_std > 0
-    if use_noise and noise.numel() < n_elements:
+    if use_noise and not stateless_noise and noise.numel() < base_offset + n_elements:
         raise ValueError(f"noise has {noise.numel()} elements but {n_elements} are required")
+    if use_noise and stateless_noise and noise_seed is None:
+        raise ValueError("stateless transformed abs-max requires noise_seed")
 
     num_blocks = triton.cdiv(n_elements, STAT_BLOCK_SIZE)
     partial_max = torch.empty(num_blocks, dtype=torch.float32, device=flat.device)
@@ -677,11 +737,15 @@ def compute_transformed_abs_max_triton(
         flat,
         noise,
         partial_max,
+        base_offset,
         n_elements,
+        flat.numel(),
         clip_scale,
         client_weight,
         noise_std,
         USE_NOISE=use_noise,
+        USE_STATELESS_NOISE=stateless_noise,
+        NOISE_SEED=0 if noise_seed is None else int(noise_seed),
         BLOCK_SIZE=STAT_BLOCK_SIZE,
     )
 
@@ -723,6 +787,38 @@ def _stat_reduce_launch_count(n_elements: int) -> int:
         current_blocks = triton.cdiv(current_blocks, MAX_REDUCE_BLOCK_SIZE)
         launches += 1
     return launches + 1
+
+
+def materialize_stateless_noise_triton(
+    n_elements: int,
+    seed: int,
+    device: torch.device,
+    base_offset: int = 0,
+    block_size: int = STAT_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Return the exact tl.randn(seed, global_offset) stream used by v2 kernels.
+
+    This helper is intentionally for validation and reference benchmarks. The
+    optimized path should prefer stateless in-kernel noise so large runs do not
+    allocate a full noise tensor.
+    """
+    if n_elements < 0:
+        raise ValueError(f"n_elements must be non-negative, got {n_elements}")
+    if base_offset < 0:
+        raise ValueError(f"base_offset must be non-negative, got {base_offset}")
+    if n_elements == 0:
+        return torch.empty(0, dtype=torch.float32, device=device)
+
+    out = torch.empty(n_elements, dtype=torch.float32, device=device)
+    grid = (triton.cdiv(n_elements, block_size),)
+    _stateless_noise_kernel[grid](
+        out,
+        n_elements,
+        seed=int(seed),
+        base_offset=base_offset,
+        BLOCK_SIZE=block_size,
+    )
+    return out
 
 
 def fused_private_update_triton(
@@ -954,7 +1050,6 @@ def fused_private_update_triton_v2(
     metrics = KernelMetrics()
     metrics.backend = "triton_v2"
     device = flat.device
-    BLOCK_SIZE = 1024
 
     if measure_time:
         torch.cuda.synchronize(device)
@@ -962,18 +1057,30 @@ def fused_private_update_triton_v2(
 
     num_params = flat.numel()
     total_slots = validate_fused_update_args(config, bundle_count, slot_capacity, num_params)
+    BLOCK_SIZE = config.pack_block_size
     metrics.input_bytes = flat.numel() * flat.element_size()
     metrics.logical_quantized_payload_bytes = (
         (num_params * config.quant_bits + 7) // 8 if config.quant_bits > 0 else 0
     )
-    metrics.kernel_launch_count = _l2_norm_launch_count(num_params)
-
     use_quant = config.quant_bits > 0
-    can_fold_quant_stat = use_quant and config.noise_multiplier <= 0
+    use_fixed_clip_scale = config.fixed_clip_scale is not None
+    use_fixed_quant_scale = use_quant and config.fixed_quant_scale is not None
+    use_chunk_quant_scale = use_quant and config.chunk_quant_scale
+    metrics.kernel_launch_count = 0 if use_fixed_clip_scale else _l2_norm_launch_count(num_params)
+    can_fold_quant_stat = (
+        use_quant
+        and config.noise_multiplier <= 0
+        and not use_fixed_quant_scale
+        and not use_chunk_quant_scale
+        and not use_fixed_clip_scale
+    )
 
     # Step 1: Compute L2 norm. Quantized no-noise runs also need abs-max; fold
     # that stat into the L2 pass so the input is not streamed twice.
-    if can_fold_quant_stat:
+    if use_fixed_clip_scale:
+        l2_norm = 0.0
+        raw_abs_max = 0.0
+    elif can_fold_quant_stat:
         l2_norm, raw_abs_max = compute_l2_norm_and_abs_max_triton(flat)
     else:
         l2_norm = compute_l2_norm_triton(flat)
@@ -981,7 +1088,11 @@ def fused_private_update_triton_v2(
     metrics.l2_norm = l2_norm
 
     # Compute clip scale on host
-    clip_scale = min(1.0, config.clip_norm / (l2_norm + 1e-8))
+    clip_scale = (
+        float(config.fixed_clip_scale)
+        if use_fixed_clip_scale
+        else min(1.0, config.clip_norm / (l2_norm + 1e-8))
+    )
     metrics.clip_scale = clip_scale
 
     if measure_time:
@@ -989,9 +1100,12 @@ def fused_private_update_triton_v2(
         t1 = time.perf_counter()
         metrics.clip_ms = (t1 - t0) * 1000
 
-    # Prepare noise buffer. Only actual parameter slots need noise; padding stays zero.
+    # Prepare noise source. Stateless noise avoids materializing a full float32
+    # noise tensor and is the preferred path for 10B+ experiments.
     noise_std = 0.0
     noise_source = "none"
+    use_stateless_noise = False
+    noise_seed_value = 0
     if measure_time:
         torch.cuda.synchronize(device)
         t_noise0 = time.perf_counter()
@@ -1013,6 +1127,13 @@ def fused_private_update_triton_v2(
             if not noise_buffer.is_contiguous():
                 noise_buffer = noise_buffer.contiguous()
             noise_source = "external"
+        elif config.stateless_noise:
+            if config.noise_seed is None:
+                raise ValueError("stateless_noise requires noise_seed")
+            noise_buffer = flat
+            use_stateless_noise = True
+            noise_seed_value = int(config.noise_seed)
+            noise_source = "stateless"
         elif config.noise_seed is not None:
             gen = torch.Generator(device=device)
             gen.manual_seed(config.noise_seed)
@@ -1022,28 +1143,44 @@ def fused_private_update_triton_v2(
             noise_buffer = torch.randn(num_params, device=device, dtype=torch.float32)
             noise_source = "random"
     else:
-        # Dummy buffer (not read when noise_std == 0)
-        noise_buffer = torch.empty(1, device=device, dtype=torch.float32)
+        # Reuse flat as a dummy pointer; kernels do not read it when noise is off.
+        noise_buffer = flat
 
-    metrics.noise_bytes = noise_buffer.numel() * noise_buffer.element_size()
+    metrics.noise_bytes = 0 if use_stateless_noise else noise_buffer.numel() * noise_buffer.element_size()
     metrics.noise_source = noise_source
     if measure_time:
         torch.cuda.synchronize(device)
         t_noise1 = time.perf_counter()
         metrics.noise_ms = (t_noise1 - t_noise0) * 1000
 
-    # Prepare quantization params
+    # Prepare quantization params. Fixed and chunk-wise scale modes deliberately
+    # skip the global transformed abs-max pass.
     quant_scale = 1.0
     quant_inv_scale = 1.0
     qmin = 0
     qmax_val = 0
+    chunk_quant_scales: List[float] = []
     if use_quant:
         qmin = -(2 ** (config.quant_bits - 1))
         qmax_val = 2 ** (config.quant_bits - 1) - 1
         if num_params > 0:
-            if can_fold_quant_stat:
+            if use_fixed_quant_scale:
+                quant_scale = float(config.fixed_quant_scale)
+                quant_inv_scale = 1.0 / quant_scale
+                abs_max_val = quant_scale * qmax_val
+                metrics.quant_abs_max = abs_max_val
+                metrics.quant_scale = quant_scale
+                metrics.quant_stat_source = "fixed_scale"
+            elif use_chunk_quant_scale:
+                metrics.quant_stat_source = "chunk_abs_max"
+            elif can_fold_quant_stat:
                 abs_max_val = raw_abs_max * abs(clip_scale * config.client_weight)
                 metrics.quant_stat_source = "l2_abs_max"
+                metrics.quant_abs_max = abs_max_val
+                if abs_max_val > 1e-8:
+                    quant_scale = abs_max_val / qmax_val
+                    quant_inv_scale = 1.0 / quant_scale
+                    metrics.quant_scale = quant_scale
             else:
                 if measure_time:
                     torch.cuda.synchronize(device)
@@ -1055,6 +1192,8 @@ def fused_private_update_triton_v2(
                     clip_scale,
                     config.client_weight,
                     noise_std,
+                    stateless_noise=use_stateless_noise,
+                    noise_seed=noise_seed_value,
                 )
                 metrics.kernel_launch_count += _stat_reduce_launch_count(num_params)
                 metrics.quant_stat_source = "transformed_abs_max"
@@ -1062,11 +1201,11 @@ def fused_private_update_triton_v2(
                     torch.cuda.synchronize(device)
                     t_stat1 = time.perf_counter()
                     metrics.quant_stat_ms = (t_stat1 - t_stat0) * 1000
-            metrics.quant_abs_max = abs_max_val
-            if abs_max_val > 1e-8:
-                quant_scale = abs_max_val / qmax_val
-                quant_inv_scale = 1.0 / quant_scale
-                metrics.quant_scale = quant_scale
+                metrics.quant_abs_max = abs_max_val
+                if abs_max_val > 1e-8:
+                    quant_scale = abs_max_val / qmax_val
+                    quant_inv_scale = 1.0 / quant_scale
+                    metrics.quant_scale = quant_scale
         else:
             metrics.quant_stat_source = "empty"
 
@@ -1113,45 +1252,96 @@ def fused_private_update_triton_v2(
                 )
             packed = packed_out.reshape(-1)
 
+    chunk_count = 0
+    post_t2_quant_stat_ms = 0.0
     if total_slots > 0:
         if num_params > 0:
-            grid = (triton.cdiv(total_slots, BLOCK_SIZE),)
-            if use_physical_int8:
-                # Int8 kernel stores quantized integers directly as int8
-                _fused_update_int8_kernel[grid](
-                    flat,
-                    noise_buffer,
-                    packed,
-                    clip_scale,
-                    config.client_weight,
-                    noise_std,
-                    quant_inv_scale,
-                    qmin,
-                    qmax_val,
-                    num_params,
-                    total_slots,
-                    slot_capacity,
-                    BLOCK_SIZE=BLOCK_SIZE,
-                )
-            else:
-                _fused_update_kernel[grid](
-                    flat,
-                    noise_buffer,
-                    packed,
-                    clip_scale,
-                    config.client_weight,
-                    noise_std,
-                    quant_inv_scale,
-                    quant_scale,
-                    qmin,
-                    qmax_val,
-                    use_quant,
-                    num_params,
-                    total_slots,
-                    slot_capacity,
-                    BLOCK_SIZE=BLOCK_SIZE,
-                )
-            metrics.kernel_launch_count += 1
+            chunk_size = config.chunk_size or total_slots
+            for base_offset in range(0, total_slots, chunk_size):
+                chunk_elems = min(chunk_size, total_slots - base_offset)
+                chunk_count += 1
+
+                chunk_quant_inv_scale = quant_inv_scale
+                chunk_quant_scale_val = quant_scale
+                if use_chunk_quant_scale and base_offset < num_params:
+                    chunk_params = min(chunk_elems, num_params - base_offset)
+                    if measure_time:
+                        torch.cuda.synchronize(device)
+                        t_chunk_stat0 = time.perf_counter()
+                    chunk_abs_max = compute_transformed_abs_max_triton(
+                        flat,
+                        noise_buffer,
+                        chunk_params,
+                        clip_scale,
+                        config.client_weight,
+                        noise_std,
+                        base_offset=base_offset,
+                        stateless_noise=use_stateless_noise,
+                        noise_seed=noise_seed_value,
+                    )
+                    metrics.kernel_launch_count += _stat_reduce_launch_count(chunk_params)
+                    if measure_time:
+                        torch.cuda.synchronize(device)
+                        t_chunk_stat1 = time.perf_counter()
+                        chunk_stat_ms = (t_chunk_stat1 - t_chunk_stat0) * 1000
+                        metrics.quant_stat_ms += chunk_stat_ms
+                        post_t2_quant_stat_ms += chunk_stat_ms
+                    if chunk_abs_max > 1e-8:
+                        chunk_quant_scale_val = chunk_abs_max / qmax_val
+                        chunk_quant_inv_scale = 1.0 / chunk_quant_scale_val
+                    else:
+                        chunk_quant_scale_val = 1.0
+                        chunk_quant_inv_scale = 1.0
+                    chunk_quant_scales.append(chunk_quant_scale_val)
+                    metrics.quant_abs_max = max(metrics.quant_abs_max, chunk_abs_max)
+                elif use_chunk_quant_scale:
+                    chunk_quant_scales.append(1.0)
+
+                grid = (triton.cdiv(chunk_elems, BLOCK_SIZE),)
+                if use_physical_int8:
+                    # Int8 kernel stores quantized integers directly as int8
+                    _fused_update_int8_kernel[grid](
+                        flat,
+                        noise_buffer,
+                        packed,
+                        clip_scale,
+                        config.client_weight,
+                        noise_std,
+                        chunk_quant_inv_scale,
+                        noise_seed_value,
+                        qmin,
+                        qmax_val,
+                        num_params,
+                        total_slots,
+                        slot_capacity,
+                        base_offset,
+                        USE_STATELESS_NOISE=use_stateless_noise,
+                        STORE_LOCAL=False,
+                        BLOCK_SIZE=BLOCK_SIZE,
+                    )
+                else:
+                    _fused_update_kernel[grid](
+                        flat,
+                        noise_buffer,
+                        packed,
+                        clip_scale,
+                        config.client_weight,
+                        noise_std,
+                        noise_seed_value,
+                        chunk_quant_inv_scale,
+                        chunk_quant_scale_val,
+                        qmin,
+                        qmax_val,
+                        use_quant,
+                        num_params,
+                        total_slots,
+                        slot_capacity,
+                        base_offset,
+                        USE_STATELESS_NOISE=use_stateless_noise,
+                        STORE_LOCAL=False,
+                        BLOCK_SIZE=BLOCK_SIZE,
+                    )
+                metrics.kernel_launch_count += 1
         else:
             packed.zero_()
 
@@ -1160,20 +1350,21 @@ def fused_private_update_triton_v2(
     metrics.output_dtype = str(packed.dtype).replace("torch.", "")
     if use_physical_int8:
         metrics.output_format = "int8_quantized"
+    if use_chunk_quant_scale and chunk_quant_scales:
+        metrics.quant_scale = max(chunk_quant_scales)
 
     if measure_time:
         torch.cuda.synchronize(device)
         t3 = time.perf_counter()
-        metrics.pack_ms = (t3 - t2) * 1000
+        pack_window_ms = (t3 - t2) * 1000
+        metrics.pack_ms = max(0.0, pack_window_ms - post_t2_quant_stat_ms)
         metrics.fused_operator_ms = metrics.quant_stat_ms + metrics.pack_ms
         metrics.total_ms = (t3 - t0) * 1000
 
-    return FusedUpdateOutput(
-        packed_slots=packed,
-        bundle_count=bundle_count,
-        slot_capacity=slot_capacity,
-        num_params=num_params,
-        metadata=metrics.to_dict() if measure_time else {
+    if measure_time:
+        metadata = metrics.to_dict()
+    else:
+        metadata = {
             "l2_norm": l2_norm,
             "clip_scale": clip_scale,
             "noise_std": noise_std,
@@ -1189,5 +1380,227 @@ def fused_private_update_triton_v2(
             "output_dtype": metrics.output_dtype,
             "output_format": metrics.output_format,
             "logical_quantized_payload_bytes": metrics.logical_quantized_payload_bytes,
-        },
+        }
+    metadata.update(
+        {
+            "stateless_noise": use_stateless_noise,
+            "noise_seed": noise_seed_value if use_stateless_noise else config.noise_seed,
+            "fixed_quant_scale": config.fixed_quant_scale,
+            "fixed_clip_scale": config.fixed_clip_scale,
+            "chunk_size": config.chunk_size,
+            "chunk_count": chunk_count,
+            "chunk_quant_scale": config.chunk_quant_scale,
+            "chunk_quant_scales": chunk_quant_scales,
+            "pack_block_size": BLOCK_SIZE,
+        }
     )
+
+    return FusedUpdateOutput(
+        packed_slots=packed,
+        bundle_count=bundle_count,
+        slot_capacity=slot_capacity,
+        num_params=num_params,
+        metadata=metadata,
+    )
+
+
+def fused_private_update_triton_v2_stream_to_cpu(
+    flat: torch.Tensor,
+    config: FusedUpdateConfig,
+    bundle_count: int,
+    slot_capacity: int = 4096,
+    output_dir: Optional[str] = None,
+    chunk_size: Optional[int] = None,
+    prefix: str = "fpu_chunk",
+    keep_cpu_chunks: bool = False,
+) -> Dict[str, Any]:
+    """Stream fixed-scale physical int8 FPU output one chunk at a time.
+
+    This path is intended for 10B+ experiments after clip/quant scales have
+    been calibrated. It avoids keeping the full int8 output tensor on GPU by
+    allocating only one chunk-sized output buffer per launch, then optionally
+    writing each chunk to disk.
+
+    Requirements are deliberately strict so the streamed payload has the same
+    semantics as the graph-safe fast path:
+    - `physical_quantized_output=True`
+    - `quant_bits=8`
+    - `fixed_clip_scale` and `fixed_quant_scale` are provided
+    - DP noise, if enabled, uses stateless noise with a seed
+    """
+    if not flat.is_cuda:
+        raise ValueError("stream_to_cpu expects a CUDA tensor")
+    if not config.physical_quantized_output or config.quant_bits != 8:
+        raise ValueError("stream_to_cpu currently requires physical int8 q8 output")
+    if config.fixed_clip_scale is None:
+        raise ValueError("stream_to_cpu requires fixed_clip_scale")
+    if config.fixed_quant_scale is None:
+        raise ValueError("stream_to_cpu requires fixed_quant_scale")
+    if config.chunk_quant_scale:
+        raise ValueError("stream_to_cpu does not support chunk_quant_scale yet")
+    if config.noise_multiplier > 0 and (not config.stateless_noise or config.noise_seed is None):
+        raise ValueError("stream_to_cpu DP noise requires stateless_noise and noise_seed")
+
+    flat = flat.detach().reshape(-1).contiguous()
+    if flat.dtype != torch.float32:
+        flat = flat.float()
+
+    device = flat.device
+    num_params = flat.numel()
+    total_slots = validate_fused_update_args(config, bundle_count, slot_capacity, num_params)
+    actual_chunk_size = chunk_size or config.chunk_size or total_slots
+    if actual_chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {actual_chunk_size}")
+
+    out_path = Path(output_dir) if output_dir is not None else None
+    if out_path is not None:
+        out_path.mkdir(parents=True, exist_ok=True)
+
+    noise_std = config.noise_multiplier * config.clip_norm
+    noise_seed = int(config.noise_seed or 0)
+    quant_inv_scale = 1.0 / float(config.fixed_quant_scale)
+    qmin = -(2 ** (config.quant_bits - 1))
+    qmax_val = 2 ** (config.quant_bits - 1) - 1
+    block_size = config.pack_block_size
+    dummy_noise = flat
+
+    chunk_files: List[Dict[str, Any]] = []
+    cpu_chunks: List[torch.Tensor] = []
+    cuda_times_ms: List[float] = []
+    write_times_ms: List[float] = []
+    chunk_count = 0
+    total_output_bytes = 0
+
+    warmup_chunks = 0
+    if total_slots > 0:
+        warmup_slots = min(actual_chunk_size, total_slots)
+        warmup_out = torch.empty(warmup_slots, dtype=torch.int8, device=device)
+        warmup_grid = (triton.cdiv(warmup_slots, block_size),)
+        _fused_update_int8_kernel[warmup_grid](
+            flat,
+            dummy_noise,
+            warmup_out,
+            float(config.fixed_clip_scale),
+            config.client_weight,
+            noise_std,
+            quant_inv_scale,
+            noise_seed,
+            qmin,
+            qmax_val,
+            num_params,
+            total_slots,
+            slot_capacity,
+            0,
+            USE_STATELESS_NOISE=config.stateless_noise and noise_std > 0,
+            STORE_LOCAL=True,
+            BLOCK_SIZE=block_size,
+        )
+        torch.cuda.synchronize(device)
+        warmup_chunks = 1
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    stream_start = time.perf_counter()
+
+    for base_offset in range(0, total_slots, actual_chunk_size):
+        slots_this_chunk = min(actual_chunk_size, total_slots - base_offset)
+        chunk_gpu = torch.empty(slots_this_chunk, dtype=torch.int8, device=device)
+        grid = (triton.cdiv(slots_this_chunk, block_size),)
+
+        torch.cuda.synchronize(device)
+        start_event.record()
+        _fused_update_int8_kernel[grid](
+            flat,
+            dummy_noise,
+            chunk_gpu,
+            float(config.fixed_clip_scale),
+            config.client_weight,
+            noise_std,
+            quant_inv_scale,
+            noise_seed,
+            qmin,
+            qmax_val,
+            num_params,
+            total_slots,
+            slot_capacity,
+            base_offset,
+            USE_STATELESS_NOISE=config.stateless_noise and noise_std > 0,
+            STORE_LOCAL=True,
+            BLOCK_SIZE=block_size,
+        )
+        end_event.record()
+        torch.cuda.synchronize(device)
+        cuda_ms = start_event.elapsed_time(end_event)
+        cuda_times_ms.append(cuda_ms)
+
+        write_start = time.perf_counter()
+        chunk_cpu = chunk_gpu.cpu().contiguous()
+        write_path = None
+        if out_path is not None:
+            write_path = out_path / f"{prefix}_{chunk_count:06d}.bin"
+            chunk_cpu.numpy().tofile(str(write_path))
+        if keep_cpu_chunks:
+            cpu_chunks.append(chunk_cpu)
+        write_times_ms.append((time.perf_counter() - write_start) * 1000)
+
+        chunk_bytes = chunk_cpu.numel() * chunk_cpu.element_size()
+        total_output_bytes += chunk_bytes
+        chunk_files.append(
+            {
+                "index": chunk_count,
+                "base_offset": base_offset,
+                "num_slots": slots_this_chunk,
+                "bytes": chunk_bytes,
+                "path": str(write_path) if write_path is not None else "",
+            }
+        )
+        chunk_count += 1
+
+    total_wall_ms = (time.perf_counter() - stream_start) * 1000
+    cuda_total_ms = float(sum(cuda_times_ms))
+    write_total_ms = float(sum(write_times_ms))
+    metadata: Dict[str, Any] = {
+        "backend": "triton_v2_stream_to_cpu",
+        "num_params": num_params,
+        "bundle_count": bundle_count,
+        "slot_capacity": slot_capacity,
+        "total_slots": total_slots,
+        "chunk_size": actual_chunk_size,
+        "chunk_count": chunk_count,
+        "warmup_chunks": warmup_chunks,
+        "chunk_files": chunk_files,
+        "kept_cpu_chunks": keep_cpu_chunks,
+        "output_dir": str(out_path) if out_path is not None else "",
+        "output_dtype": "int8",
+        "output_format": "int8_quantized_stream",
+        "output_bytes": total_output_bytes,
+        "input_bytes": flat.numel() * flat.element_size(),
+        "compression_ratio": (flat.numel() * flat.element_size()) / max(total_output_bytes, 1),
+        "noise_source": "stateless" if noise_std > 0 else "none",
+        "noise_bytes": 0,
+        "noise_seed": noise_seed if noise_std > 0 else None,
+        "noise_std": noise_std,
+        "quant_stat_source": "fixed_scale",
+        "quant_stat_ms": 0.0,
+        "quant_scale": float(config.fixed_quant_scale),
+        "fixed_clip_scale": float(config.fixed_clip_scale),
+        "pack_block_size": block_size,
+        "cuda_total_ms": cuda_total_ms,
+        "cuda_mean_ms": cuda_total_ms / max(chunk_count, 1),
+        "write_total_ms": write_total_ms,
+        "wall_total_ms": total_wall_ms,
+        "kernel_launch_count": chunk_count,
+        "cuda_times_ms": cuda_times_ms,
+        "write_times_ms": write_times_ms,
+        "cpu_chunks": cpu_chunks,
+    }
+
+    if out_path is not None:
+        metadata_path = out_path / f"{prefix}_metadata.json"
+        serializable = dict(metadata)
+        serializable.pop("cpu_chunks", None)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2)
+        metadata["metadata_path"] = str(metadata_path)
+
+    return metadata

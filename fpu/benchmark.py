@@ -132,6 +132,8 @@ def benchmark_kernel(
     num_iterations: int = 100,
     backend: str = "triton",
     reuse_buffers: bool = False,
+    use_cuda_graph: bool = False,
+    measure_output_quality: bool = False,
     lock_clocks: bool = False,
     verbose: bool = True,
 ) -> Dict[str, Any]:
@@ -147,6 +149,8 @@ def benchmark_kernel(
         num_iterations: Measurement iterations (default 100)
         backend: "triton", "triton_v2", or "torch_ref"
         reuse_buffers: Reuse v2 output/noise buffers across iterations
+        use_cuda_graph: Replay a graph-captured pack-only v2 path when possible
+        measure_output_quality: Compute optional output quality metrics
         lock_clocks: Attempt GPU clock locking for stable results
         verbose: Print results
 
@@ -188,7 +192,7 @@ def benchmark_kernel(
                 )
                 out_dtype = torch.int8 if use_physical_int8 else torch.float32
                 packed_out = torch.empty(total_slots, dtype=out_dtype, device=device)
-                if config.noise_multiplier > 0:
+                if config.noise_multiplier > 0 and not config.stateless_noise:
                     if config.noise_seed is not None:
                         gen = torch.Generator(device=device)
                         gen.manual_seed(config.noise_seed)
@@ -221,6 +225,39 @@ def benchmark_kernel(
             _ = run_kernel(measure_time=False)
         torch.cuda.synchronize()
 
+        # --- Optional CUDA Graph replay path ---
+        cuda_graph_enabled = False
+        cuda_graph_error = ""
+        cuda_graph = None
+        if use_cuda_graph:
+            graph_requirements_ok = (
+                backend == "triton_v2"
+                and reuse_buffers
+                and config.fixed_clip_scale is not None
+                and (config.quant_bits <= 0 or config.fixed_quant_scale is not None)
+                and not config.chunk_quant_scale
+            )
+            if not graph_requirements_ok:
+                cuda_graph_error = (
+                    "CUDA Graph requires backend=triton_v2, reuse_buffers=True, "
+                    "fixed_clip_scale, fixed_quant_scale for quantized runs, and "
+                    "chunk_quant_scale=False"
+                )
+            else:
+                try:
+                    # Compile kernels before capture so graph setup measures replay
+                    # overhead rather than first-use compilation.
+                    _ = run_kernel(measure_time=False)
+                    torch.cuda.synchronize()
+                    cuda_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(cuda_graph):
+                        _ = run_kernel(measure_time=False)
+                    torch.cuda.synchronize()
+                    cuda_graph_enabled = True
+                except Exception as exc:  # pragma: no cover - environment-specific
+                    cuda_graph_enabled = False
+                    cuda_graph_error = str(exc)
+
         # --- Peak memory (single run after warmup) ---
         torch.cuda.reset_peak_memory_stats(device)
         _ = run_kernel(measure_time=False)
@@ -237,7 +274,10 @@ def benchmark_kernel(
             torch.cuda.synchronize()
             start_event.record()
             t0 = time.perf_counter()
-            _ = run_kernel(measure_time=False)
+            if cuda_graph_enabled and cuda_graph is not None:
+                cuda_graph.replay()
+            else:
+                _ = run_kernel(measure_time=False)
             end_event.record()
             torch.cuda.synchronize()
             t1 = time.perf_counter()
@@ -259,6 +299,20 @@ def benchmark_kernel(
         # Inspect actual output tensor
         packed = measured_output.packed_slots
         actual_output_bytes = packed.numel() * packed.element_size()
+        saturation_count = 0
+        saturation_rate = 0.0
+        if (
+            measure_output_quality
+            and config.physical_quantized_output
+            and config.quant_bits == 8
+            and packed.dtype == torch.int8
+            and num_params > 0
+        ):
+            payload = packed.reshape(-1)[:num_params]
+            qmin_i8 = -(2 ** (config.quant_bits - 1))
+            qmax_i8 = 2 ** (config.quant_bits - 1) - 1
+            saturation_count = int(((payload == qmin_i8) | (payload == qmax_i8)).sum().item())
+            saturation_rate = saturation_count / num_params
 
         # Logical output bytes: what the compressed payload would be
         total_slots = bundle_count * slot_capacity
@@ -284,8 +338,19 @@ def benchmark_kernel(
             "noise_multiplier": config.noise_multiplier,
             "quant_bits": config.quant_bits,
             "physical_quantized_output": config.physical_quantized_output,
+            "stateless_noise": config.stateless_noise,
+            "noise_seed": config.noise_seed,
+            "fixed_quant_scale": config.fixed_quant_scale,
+            "fixed_clip_scale": config.fixed_clip_scale,
+            "chunk_size": config.chunk_size,
+            "chunk_quant_scale": config.chunk_quant_scale,
+            "pack_block_size": config.pack_block_size,
             "client_weight": config.client_weight,
             "reuse_buffers": reuse_buffers,
+            "cuda_graph_requested": use_cuda_graph,
+            "cuda_graph_enabled": cuda_graph_enabled,
+            "cuda_graph_error": cuda_graph_error,
+            "measure_output_quality": measure_output_quality,
             "num_params": num_params,
             "bundle_count": bundle_count,
             "slot_capacity": slot_capacity,
@@ -312,6 +377,10 @@ def benchmark_kernel(
             "quant_stat_source": meta.get("quant_stat_source", "none"),
             "quant_abs_max": meta.get("quant_abs_max", 0.0),
             "quant_scale": meta.get("quant_scale", 1.0),
+            "clip_scale": meta.get("clip_scale", 1.0),
+            "l2_norm": meta.get("l2_norm", 0.0),
+            "chunk_count": meta.get("chunk_count", 0),
+            "chunk_quant_scales": meta.get("chunk_quant_scales", []),
             "packing_ms": pack_ms,
             "noise_ms": meta.get("noise_ms", 0.0),
             "noise_bytes": meta.get("noise_bytes", 0),
@@ -322,6 +391,8 @@ def benchmark_kernel(
             "packed_shape": list(packed.shape),
             "packed_numel": packed.numel(),
             "packed_element_size": packed.element_size(),
+            "saturation_count": saturation_count,
+            "saturation_rate": saturation_rate,
             # Byte-accurate I/O stats
             "input_bytes": input_bytes,
             "input_mb": round(input_bytes / 1e6, 3),
@@ -394,6 +465,8 @@ def _print_benchmark_summary(r: Dict[str, Any]) -> None:
     print(f"    dtype={r['output_dtype']}, format={r['output_format']}")
     print(f"    shape={r['packed_shape']}, numel={r['packed_numel']}")
     print(f"    element_size={r['packed_element_size']} bytes")
+    if r.get("measure_output_quality"):
+        print(f"    saturation_rate={r.get('saturation_rate', 0.0):.4%}")
     print(f"  I/O bytes (actual physical):")
     print(f"    input_mb:          {r['input_mb']:.3f}")
     print(f"    actual_output_mb:  {r['actual_output_mb']:.3f}")
@@ -712,6 +785,10 @@ def save_sweep_results(
     csv_columns = [
         "sweep_slot_capacity", "sweep_quant_bits", "sweep_reuse_buffers",
         "sweep_client_weight", "sweep_physical_quant",
+        "stateless_noise", "fixed_quant_scale", "chunk_size",
+        "fixed_clip_scale", "chunk_quant_scale", "pack_block_size",
+        "chunk_count", "cuda_graph_requested", "cuda_graph_enabled",
+        "measure_output_quality", "saturation_rate", "saturation_count",
         "cuda_mean_ms", "cuda_median_ms", "cuda_std_ms", "cuda_p90_ms",
         "cuda_cv_pct", "kernel_launch_count",
         "fused_operator_ms", "quant_stat_ms", "packing_ms",

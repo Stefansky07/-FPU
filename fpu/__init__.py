@@ -22,11 +22,13 @@ try:
     from .triton_kernel import (
         fused_private_update_triton,
         fused_private_update_triton_v2,
+        fused_private_update_triton_v2_stream_to_cpu,
     )
     _HAS_TRITON = True
 except ImportError:
     fused_private_update_triton = None
     fused_private_update_triton_v2 = None
+    fused_private_update_triton_v2_stream_to_cpu = None
     _HAS_TRITON = False
 
 __version__ = "0.1.1"
@@ -36,5 +38,6 @@ __all__ = [
     "fused_private_update_ref",
     "fused_private_update_triton",
     "fused_private_update_triton_v2",
+    "fused_private_update_triton_v2_stream_to_cpu",
     "_HAS_TRITON",
 ]

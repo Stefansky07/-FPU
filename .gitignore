@@ -19,6 +19,16 @@ Thumbs.db
 
 # Benchmark results (regenerable)
 results/*.json
+results/**/*.json
+results/**/*.csv
+results/**/*.bin
 
 # Triton cache
 .triton/
+.triton-cache/
+
+# Internal planning / development docs (not for public repo)
+AGENTS.md
+optimization_plan.md
+todo.md
+gpu_validation_plan.md

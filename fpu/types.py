@@ -40,6 +40,29 @@ class FusedUpdateConfig:
     # Random seed for noise generation (None = random)
     noise_seed: Optional[int] = None
 
+    # Generate DP noise inside Triton kernels as randn(seed, global_offset)
+    # instead of materializing a full float32 noise tensor.
+    stateless_noise: bool = False
+
+    # Skip abs-max quantization statistics and use this quantization scale
+    # directly. This is an experimental fast path for calibrated/fixed-scale
+    # benchmarks.
+    fixed_quant_scale: Optional[float] = None
+
+    # Skip L2 reduction and use this clip scale directly. This is intended for
+    # CUDA Graph / pack-only experiments after the scale has been calibrated.
+    fixed_clip_scale: Optional[float] = None
+
+    # Process the pack kernel in chunks. This is useful for large-scale
+    # experiments and for later CPU/GPU streaming integration.
+    chunk_size: Optional[int] = None
+
+    # Compute an independent quantization scale per chunk. Requires chunk_size.
+    chunk_quant_scale: bool = False
+
+    # Triton block size used by the fused pack kernels.
+    pack_block_size: int = 1024
+
     def validate(self) -> None:
         """Validate scalar configuration before launching GPU work."""
         if not math.isfinite(self.clip_norm) or self.clip_norm <= 0:
@@ -63,6 +86,53 @@ class FusedUpdateConfig:
             raise ValueError(f"client_weight must be finite, got {self.client_weight}")
         if not math.isfinite(self.ckks_scale) or self.ckks_scale <= 0:
             raise ValueError(f"ckks_scale must be a positive finite value, got {self.ckks_scale}")
+        if not isinstance(self.stateless_noise, bool):
+            raise TypeError(
+                f"stateless_noise must be a boolean, got {type(self.stateless_noise).__name__}"
+            )
+        if self.stateless_noise and self.noise_multiplier > 0 and self.noise_seed is None:
+            raise ValueError("stateless_noise with DP noise requires noise_seed for reproducibility")
+        if self.fixed_quant_scale is not None:
+            if (
+                not isinstance(self.fixed_quant_scale, (float, int))
+                or not math.isfinite(float(self.fixed_quant_scale))
+                or float(self.fixed_quant_scale) <= 0
+            ):
+                raise ValueError(
+                    "fixed_quant_scale must be a positive finite value when provided"
+                )
+        if self.fixed_clip_scale is not None:
+            if (
+                not isinstance(self.fixed_clip_scale, (float, int))
+                or not math.isfinite(float(self.fixed_clip_scale))
+                or float(self.fixed_clip_scale) <= 0
+            ):
+                raise ValueError(
+                    "fixed_clip_scale must be a positive finite value when provided"
+                )
+        if self.chunk_size is not None:
+            if isinstance(self.chunk_size, bool) or not isinstance(self.chunk_size, int):
+                raise TypeError(
+                    f"chunk_size must be an integer or None, got {type(self.chunk_size).__name__}"
+                )
+            if self.chunk_size <= 0:
+                raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
+        if not isinstance(self.chunk_quant_scale, bool):
+            raise TypeError(
+                f"chunk_quant_scale must be a boolean, got {type(self.chunk_quant_scale).__name__}"
+            )
+        if self.chunk_quant_scale and self.chunk_size is None:
+            raise ValueError("chunk_quant_scale requires chunk_size")
+        if self.chunk_quant_scale and self.fixed_quant_scale is not None:
+            raise ValueError("chunk_quant_scale and fixed_quant_scale are mutually exclusive")
+        if isinstance(self.pack_block_size, bool) or not isinstance(self.pack_block_size, int):
+            raise TypeError(
+                f"pack_block_size must be an integer, got {type(self.pack_block_size).__name__}"
+            )
+        if self.pack_block_size <= 0 or self.pack_block_size > 8192:
+            raise ValueError("pack_block_size must be in the range [1, 8192]")
+        if self.pack_block_size & (self.pack_block_size - 1):
+            raise ValueError("pack_block_size must be a power of two")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -73,6 +143,12 @@ class FusedUpdateConfig:
             "client_weight": self.client_weight,
             "ckks_scale": self.ckks_scale,
             "noise_seed": self.noise_seed,
+            "stateless_noise": self.stateless_noise,
+            "fixed_quant_scale": self.fixed_quant_scale,
+            "fixed_clip_scale": self.fixed_clip_scale,
+            "chunk_size": self.chunk_size,
+            "chunk_quant_scale": self.chunk_quant_scale,
+            "pack_block_size": self.pack_block_size,
         }
 
 

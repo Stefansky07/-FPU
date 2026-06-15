@@ -5,6 +5,7 @@ Validation utilities for verifying kernel correctness.
 from __future__ import annotations
 
 import sys
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -20,6 +21,8 @@ try:
         compute_transformed_abs_max_triton,
         fused_private_update_triton,
         fused_private_update_triton_v2,
+        fused_private_update_triton_v2_stream_to_cpu,
+        materialize_stateless_noise_triton,
     )
     _HAS_TRITON = True
 except ImportError:
@@ -557,6 +560,347 @@ def validate_physical_int8_output(
     return passed
 
 
+def validate_stateless_noise_reproducibility(
+    num_params: int = 100_000,
+    slot_capacity: int = 4096,
+    verbose: bool = True,
+) -> bool:
+    """Validate seeded stateless Triton noise is reproducible and buffer-free."""
+    if not check_triton_available():
+        return True
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2026)
+
+    flat = torch.randn(num_params, generator=gen, device=device, dtype=torch.float32)
+    bundle_count = (num_params + slot_capacity - 1) // slot_capacity
+
+    config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+        noise_seed=1234,
+        stateless_noise=True,
+    )
+    out_a = fused_private_update_triton_v2(
+        flat, config, bundle_count, slot_capacity, measure_time=True,
+    )
+    out_b = fused_private_update_triton_v2(
+        flat, config, bundle_count, slot_capacity, measure_time=True,
+    )
+    materialized_noise = materialize_stateless_noise_triton(
+        num_params, seed=1234, device=device,
+    )
+    external_ref_config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+    )
+    out_external_ref = fused_private_update_triton_v2(
+        flat,
+        external_ref_config,
+        bundle_count,
+        slot_capacity,
+        measure_time=True,
+        noise=materialized_noise,
+    )
+
+    config_other_seed = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+        noise_seed=1235,
+        stateless_noise=True,
+    )
+    out_c = fused_private_update_triton_v2(
+        flat, config_other_seed, bundle_count, slot_capacity, measure_time=True,
+    )
+
+    same_seed_ok = bool(torch.equal(out_a.packed_slots, out_b.packed_slots))
+    different_seed_changes = bool(not torch.equal(out_a.packed_slots, out_c.packed_slots))
+    external_ref_ok = bool(torch.equal(out_a.packed_slots, out_external_ref.packed_slots))
+    scale_ref_ok = (
+        abs(float(out_a.metadata.get("quant_scale", 0.0))
+            - float(out_external_ref.metadata.get("quant_scale", -1.0)))
+        < 1e-12
+    )
+    stateless_abs_max = compute_transformed_abs_max_triton(
+        flat,
+        flat,
+        num_params,
+        float(out_a.metadata["clip_scale"]),
+        config.client_weight,
+        float(out_a.metadata["noise_std"]),
+        stateless_noise=True,
+        noise_seed=1234,
+    )
+    ref_abs_max = compute_transformed_abs_max_triton(
+        flat,
+        materialized_noise,
+        num_params,
+        float(out_a.metadata["clip_scale"]),
+        config.client_weight,
+        float(out_a.metadata["noise_std"]),
+    )
+    stat_ref_ok = abs(stateless_abs_max - ref_abs_max) / (abs(ref_abs_max) + 1e-8) < 1e-6
+    source_ok = out_a.metadata.get("noise_source") == "stateless"
+    bytes_ok = int(out_a.metadata.get("noise_bytes", -1)) == 0
+    seed_ok = out_a.metadata.get("noise_seed") == 1234
+    passed = (
+        same_seed_ok
+        and different_seed_changes
+        and external_ref_ok
+        and scale_ref_ok
+        and stat_ref_ok
+        and source_ok
+        and bytes_ok
+        and seed_ok
+    )
+
+    if verbose:
+        print("\n--- Stateless Noise Reproducibility Test ---")
+        print(f"  Params: {num_params:,}")
+        print(f"  Same seed deterministic: {'yes' if same_seed_ok else 'NO'}")
+        print(f"  Different seed changes output: {'yes' if different_seed_changes else 'NO'}")
+        print(f"  Matches materialized external-noise reference: {'yes' if external_ref_ok else 'NO'}")
+        print(f"  Quant scale matches reference: {'yes' if scale_ref_ok else 'NO'}")
+        print(f"  Abs-max stat matches reference: {'yes' if stat_ref_ok else 'NO'}")
+        print(f"  Noise source: {out_a.metadata.get('noise_source')}")
+        print(f"  Noise bytes: {out_a.metadata.get('noise_bytes')}")
+        print(f"  Result: {'PASSED' if passed else 'FAILED'}")
+
+    return passed
+
+
+def validate_fixed_quant_scale_fast_path(
+    num_params: int = 100_000,
+    slot_capacity: int = 4096,
+    verbose: bool = True,
+) -> bool:
+    """Validate fixed quant scale skips transformed abs-max statistics."""
+    if not check_triton_available():
+        return True
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2026)
+
+    flat = torch.randn(num_params, generator=gen, device=device, dtype=torch.float32)
+    bundle_count = (num_params + slot_capacity - 1) // slot_capacity
+    fixed_scale = 1.0 / 127.0
+
+    config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+        noise_seed=42,
+        stateless_noise=True,
+        fixed_quant_scale=fixed_scale,
+    )
+    output = fused_private_update_triton_v2(
+        flat, config, bundle_count, slot_capacity, measure_time=True,
+    )
+
+    noise = materialize_stateless_noise_triton(num_params, seed=42, device=device)
+    clip_scale = float(output.metadata["clip_scale"])
+    noise_std = float(output.metadata["noise_std"])
+    transformed = flat * (clip_scale * config.client_weight) + noise * noise_std
+    qmin = -(2 ** (config.quant_bits - 1))
+    qmax = 2 ** (config.quant_bits - 1) - 1
+    expected_q = torch.clamp(torch.round(transformed / fixed_scale), qmin, qmax).to(torch.int8)
+    expected = torch.zeros(bundle_count * slot_capacity, dtype=torch.int8, device=device)
+    expected[:num_params] = expected_q
+    expected = expected.reshape(bundle_count, slot_capacity)
+
+    output_ok = bool(torch.equal(output.packed_slots, expected))
+    saturation_rate = float(((expected_q == qmin) | (expected_q == qmax)).float().mean().item())
+    dequantized = expected_q.float() * fixed_scale
+    max_recon_error = float(torch.max(torch.abs(dequantized - transformed)).item())
+    finite_error_ok = math.isfinite(max_recon_error)
+    source_ok = output.metadata.get("quant_stat_source") == "fixed_scale"
+    stat_time_ok = float(output.metadata.get("quant_stat_ms", -1.0)) == 0.0
+    scale_ok = abs(float(output.metadata.get("quant_scale", 0.0)) - fixed_scale) < 1e-12
+    noise_ok = output.metadata.get("noise_source") == "stateless"
+    dtype_ok = output.packed_slots.dtype == torch.int8
+    passed = (
+        source_ok
+        and stat_time_ok
+        and scale_ok
+        and noise_ok
+        and dtype_ok
+        and output_ok
+        and finite_error_ok
+    )
+
+    if verbose:
+        print("\n--- Fixed Quant Scale Fast Path Test ---")
+        print(f"  Params: {num_params:,}")
+        print(f"  Quant stat source: {output.metadata.get('quant_stat_source')}")
+        print(f"  Quant stat ms: {output.metadata.get('quant_stat_ms', 0.0):.3f}")
+        print(f"  Quant scale: {output.metadata.get('quant_scale'):.6e}")
+        print(f"  Noise source: {output.metadata.get('noise_source')}")
+        print(f"  Output matches manual fixed-scale int8: {'yes' if output_ok else 'NO'}")
+        print(f"  Saturation rate: {saturation_rate:.4%}")
+        print(f"  Max reconstruction error: {max_recon_error:.3e}")
+        print(f"  Result: {'PASSED' if passed else 'FAILED'}")
+
+    return passed
+
+
+def validate_chunked_v2_paths(
+    num_params: int = 100_000,
+    slot_capacity: int = 4096,
+    chunk_size: int = 8192,
+    verbose: bool = True,
+) -> bool:
+    """Validate chunked launches match unchunked fixed-scale output."""
+    if not check_triton_available():
+        return True
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2026)
+
+    flat = torch.randn(num_params, generator=gen, device=device, dtype=torch.float32)
+    bundle_count = (num_params + slot_capacity - 1) // slot_capacity
+    fixed_scale = 1.0 / 127.0
+
+    base_config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+        noise_seed=2027,
+        stateless_noise=True,
+        fixed_quant_scale=fixed_scale,
+    )
+    chunk_config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+        noise_seed=2027,
+        stateless_noise=True,
+        fixed_quant_scale=fixed_scale,
+        chunk_size=chunk_size,
+    )
+    chunk_scale_config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+        noise_seed=2027,
+        stateless_noise=True,
+        chunk_size=chunk_size,
+        chunk_quant_scale=True,
+    )
+
+    base = fused_private_update_triton_v2(
+        flat, base_config, bundle_count, slot_capacity, measure_time=True,
+    )
+    chunked = fused_private_update_triton_v2(
+        flat, chunk_config, bundle_count, slot_capacity, measure_time=True,
+    )
+    chunk_scaled = fused_private_update_triton_v2(
+        flat, chunk_scale_config, bundle_count, slot_capacity, measure_time=True,
+    )
+
+    output_match = bool(torch.equal(base.packed_slots, chunked.packed_slots))
+    chunk_count = int(chunked.metadata.get("chunk_count", 0))
+    expected_chunks = (bundle_count * slot_capacity + chunk_size - 1) // chunk_size
+    chunk_count_ok = chunk_count == expected_chunks
+    scale_list_ok = len(chunk_scaled.metadata.get("chunk_quant_scales", [])) == expected_chunks
+    source_ok = chunk_scaled.metadata.get("quant_stat_source") == "chunk_abs_max"
+    dtype_ok = chunk_scaled.packed_slots.dtype == torch.int8
+    padding_ok = True
+    if chunk_scaled.padding_slots > 0:
+        padding = chunk_scaled.packed_slots.reshape(-1)[num_params:]
+        padding_ok = bool(torch.all(padding == 0).item())
+
+    passed = output_match and chunk_count_ok and scale_list_ok and source_ok and dtype_ok and padding_ok
+
+    if verbose:
+        print("\n--- Chunked V2 Path Test ---")
+        print(f"  Params: {num_params:,}")
+        print(f"  Chunk size: {chunk_size:,}")
+        print(f"  Chunk count: {chunk_count} (expected {expected_chunks})")
+        print(f"  Fixed-scale chunk output matches unchunked: {'yes' if output_match else 'NO'}")
+        print(f"  Chunk scale entries: {len(chunk_scaled.metadata.get('chunk_quant_scales', []))}")
+        print(f"  Chunk quant source: {chunk_scaled.metadata.get('quant_stat_source')}")
+        print(f"  Padding zeroed: {'yes' if padding_ok else 'NO'}")
+        print(f"  Result: {'PASSED' if passed else 'FAILED'}")
+
+    return passed
+
+
+def validate_stream_to_cpu_matches_full_output(
+    num_params: int = 100_000,
+    slot_capacity: int = 4096,
+    chunk_size: int = 8192,
+    verbose: bool = True,
+) -> bool:
+    """Validate streaming int8 chunks reconstruct the normal full output."""
+    if not check_triton_available():
+        return True
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2026)
+
+    flat = torch.randn(num_params, generator=gen, device=device, dtype=torch.float32)
+    bundle_count = (num_params + slot_capacity - 1) // slot_capacity
+    config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.1,
+        quant_bits=8,
+        physical_quantized_output=True,
+        noise_seed=2027,
+        stateless_noise=True,
+        fixed_clip_scale=1.0,
+        fixed_quant_scale=1.0 / 127.0,
+        chunk_size=chunk_size,
+    )
+
+    full = fused_private_update_triton_v2(
+        flat, config, bundle_count, slot_capacity, measure_time=True,
+    )
+    streamed = fused_private_update_triton_v2_stream_to_cpu(
+        flat,
+        config,
+        bundle_count,
+        slot_capacity=slot_capacity,
+        chunk_size=chunk_size,
+        keep_cpu_chunks=True,
+    )
+
+    reconstructed = torch.cat(streamed["cpu_chunks"]).reshape(bundle_count, slot_capacity)
+    output_match = bool(torch.equal(reconstructed, full.packed_slots.cpu()))
+    source_ok = streamed.get("noise_source") == "stateless"
+    bytes_ok = streamed.get("noise_bytes") == 0
+    stat_ok = streamed.get("quant_stat_source") == "fixed_scale"
+    chunk_count_ok = streamed.get("chunk_count", 0) == (
+        (bundle_count * slot_capacity + chunk_size - 1) // chunk_size
+    )
+    passed = output_match and source_ok and bytes_ok and stat_ok and chunk_count_ok
+
+    if verbose:
+        print("\n--- Stream-to-CPU Output Test ---")
+        print(f"  Params: {num_params:,}")
+        print(f"  Chunk size: {chunk_size:,}")
+        print(f"  Chunk count: {streamed.get('chunk_count')}")
+        print(f"  Reconstructed output matches full output: {'yes' if output_match else 'NO'}")
+        print(f"  Noise source: {streamed.get('noise_source')}")
+        print(f"  Quant stat source: {streamed.get('quant_stat_source')}")
+        print(f"  Result: {'PASSED' if passed else 'FAILED'}")
+
+    return passed
+
+
 def create_test_state_dict(
     model_type: str = "tiny_cnn",
     seed: int = 42,
@@ -692,6 +1036,18 @@ def run_validation_suite(
         all_passed = False
 
     if not validate_physical_int8_output(verbose=verbose):
+        all_passed = False
+
+    if not validate_stateless_noise_reproducibility(verbose=verbose):
+        all_passed = False
+
+    if not validate_fixed_quant_scale_fast_path(verbose=verbose):
+        all_passed = False
+
+    if not validate_chunked_v2_paths(verbose=verbose):
+        all_passed = False
+
+    if not validate_stream_to_cpu_matches_full_output(verbose=verbose):
         all_passed = False
 
     if verbose:
