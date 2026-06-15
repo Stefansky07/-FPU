@@ -62,6 +62,30 @@ def main():
         help="Measurement iterations for benchmark mode",
     )
     parser.add_argument(
+        "--clip-norm",
+        type=float,
+        default=1.0,
+        help="Clipping norm for single-model benchmark mode",
+    )
+    parser.add_argument(
+        "--noise-multiplier",
+        type=float,
+        default=0.1,
+        help="DP noise multiplier for single-model benchmark mode",
+    )
+    parser.add_argument(
+        "--quant-bits",
+        type=int,
+        default=8,
+        help="Quantization bits for single-model benchmark mode (0 disables quantization)",
+    )
+    parser.add_argument(
+        "--client-weight",
+        type=float,
+        default=1.0,
+        help="Client weight for single-model benchmark mode",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -126,7 +150,12 @@ def main():
             num_params = sum(t.numel() for t in state_dict.values())
             bundle_count = (num_params + 4095) // 4096
 
-            config = FusedUpdateConfig(clip_norm=1.0, noise_multiplier=0.1, quant_bits=8)
+            config = FusedUpdateConfig(
+                clip_norm=args.clip_norm,
+                noise_multiplier=args.noise_multiplier,
+                quant_bits=args.quant_bits,
+                client_weight=args.client_weight,
+            )
             results = benchmark_kernel(
                 state_dict, config, bundle_count,
                 num_warmup=args.warmup, num_iterations=args.iterations,

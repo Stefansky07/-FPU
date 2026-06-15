@@ -93,6 +93,10 @@ def benchmark_kernel(
 
     results = {
         "backend": backend,
+        "clip_norm": config.clip_norm,
+        "noise_multiplier": config.noise_multiplier,
+        "quant_bits": config.quant_bits,
+        "client_weight": config.client_weight,
         "num_params": num_params,
         "bundle_count": bundle_count,
         "slot_capacity": slot_capacity,

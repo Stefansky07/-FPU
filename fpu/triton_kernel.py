@@ -32,6 +32,9 @@ L2_BLOCK_SIZE = 1024
 MAX_REDUCE_BLOCK_SIZE = 65536
 STAT_BLOCK_SIZE = 1024
 
+# Large synthetic runs can exceed the signed int32 index range. Keep tensor
+# offsets int64 inside Triton kernels so pointer arithmetic stays valid.
+
 
 # ============================================================================
 # Triton Kernel: L2 Norm Reduction (Two-Pass for Numerical Stability)
@@ -49,9 +52,9 @@ def _l2_norm_partial_kernel(
     Each program instance writes one partial sum to avoid atomic_add
     non-determinism and float32 accumulation precision loss.
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < n_elements
 
     # Load and compute squares
@@ -74,7 +77,7 @@ def _l2_norm_reduce_kernel(
     Pass 2: Reduce partial sums into a single total sum of squares.
     Single program instance performs the final reduction.
     """
-    offsets = tl.arange(0, BLOCK_SIZE)
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < num_blocks
 
     partial = tl.load(partial_sums_ptr + offsets, mask=mask, other=0.0)
@@ -90,9 +93,9 @@ def _sum_reduce_blocks_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Reduce a partial-sum buffer into another partial-sum buffer."""
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < num_blocks
 
     partial = tl.load(partial_sums_ptr + offsets, mask=mask, other=0.0)
@@ -116,9 +119,9 @@ def _abs_max_transform_partial_kernel(
     Compute per-block abs max after clip/weight/noise without materializing
     the transformed vector.
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < n_elements
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
@@ -139,9 +142,9 @@ def _max_reduce_blocks_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Reduce a partial max buffer into another partial max buffer."""
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < num_blocks
 
     partial = tl.load(partial_max_ptr + offsets, mask=mask, other=0.0)
@@ -157,7 +160,7 @@ def _max_reduce_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Final single-program max reduction."""
-    offsets = tl.arange(0, BLOCK_SIZE)
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < num_blocks
 
     partial = tl.load(partial_max_ptr + offsets, mask=mask, other=0.0)
@@ -184,9 +187,9 @@ def _scale_and_clip_kernel(
 
     clip_scale is pre-computed on the host as min(1.0, clip_norm / (l2_norm + eps)).
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < n_elements
 
     # Load values
@@ -213,9 +216,9 @@ def _add_noise_kernel(
     Add pre-generated Gaussian noise to gradient.
     out = x + noise * noise_std
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < n_elements
 
     # Load values
@@ -253,9 +256,9 @@ def _quantize_kernel(
         inv_scale: 1.0 / scale, pre-computed for efficiency (= qmax / abs_max)
         scale: abs_max / qmax, used for dequantization
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < n_elements
 
     # Load values
@@ -289,9 +292,9 @@ def _pack_to_slots_kernel(
     The bundle_id / slot_offset decomposition is kept for future non-linear
     LayoutPlan support where layers may be reordered across bundles.
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < n_elements
 
     # Only process up to num_params
@@ -353,9 +356,9 @@ def _fused_update_kernel(
     3. x = dequant(quant(x))          (if use_quant)
     4. packed[bundle_id, slot_offset] = x
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     # Padding slots are already zero-initialized by the output allocation.
     mask = offsets < num_params
