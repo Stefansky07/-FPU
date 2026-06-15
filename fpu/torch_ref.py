@@ -13,7 +13,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 
-from .types import FusedUpdateConfig, FusedUpdateOutput, KernelMetrics
+from .types import (
+    FusedUpdateConfig,
+    FusedUpdateOutput,
+    KernelMetrics,
+    validate_fused_update_args,
+)
 
 
 def flatten_state_dict(state_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -82,7 +87,11 @@ def quantize_tensor(flat: torch.Tensor, quant_bits: int) -> torch.Tensor:
 
     Maps float values to [-2^(bits-1), 2^(bits-1)-1] range.
     """
-    if quant_bits <= 0 or quant_bits >= 32:
+    if quant_bits <= 0:
+        return flat
+    if quant_bits == 1 or quant_bits >= 32:
+        raise ValueError("quant_bits must be 0 or an integer in [2, 31]")
+    if flat.numel() == 0:
         return flat
 
     qmin = -(2 ** (quant_bits - 1))
@@ -121,7 +130,9 @@ def pack_to_slots(
         packed: [bundle_count, slot_capacity] tensor
     """
     device = flat.device
-    total_slots = bundle_count * slot_capacity
+    total_slots = validate_fused_update_args(
+        FusedUpdateConfig(), bundle_count, slot_capacity, num_params
+    )
 
     # Create padded tensor
     padded = torch.zeros(total_slots, dtype=torch.float32, device=device)
@@ -162,6 +173,7 @@ def fused_private_update_ref(
         FusedUpdateOutput with packed slots and metadata
     """
     metrics = KernelMetrics()
+    metrics.backend = "torch_ref"
 
     if measure_time:
         torch.cuda.synchronize(device)
@@ -170,6 +182,7 @@ def fused_private_update_ref(
     # Step 1: Flatten
     flat = flatten_state_dict(state_dict).to(device)
     num_params = flat.numel()
+    validate_fused_update_args(config, bundle_count, slot_capacity, num_params)
     metrics.input_bytes = flat.numel() * flat.element_size()
 
     if measure_time:

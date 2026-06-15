@@ -37,7 +37,7 @@ def benchmark_kernel(
         slot_capacity: Slots per bundle
         num_warmup: Warmup iterations
         num_iterations: Measurement iterations
-        backend: "triton" or "torch_ref"
+        backend: "triton", "triton_v2", or "torch_ref"
         verbose: Print results
 
     Returns:
@@ -49,16 +49,30 @@ def benchmark_kernel(
     device = torch.device("cuda")
 
     # Select implementation
+    flat_gpu = None
     if backend == "triton":
-        kernel_fn = fused_private_update_triton
+        def run_kernel(measure_time: bool = False) -> FusedUpdateOutput:
+            return fused_private_update_triton(
+                state_dict, config, bundle_count, slot_capacity, device, measure_time=measure_time
+            )
+    elif backend == "triton_v2":
+        flat_gpu = flatten_state_dict(state_dict).to(device)
+
+        def run_kernel(measure_time: bool = False) -> FusedUpdateOutput:
+            return fused_private_update_triton_v2(
+                flat_gpu, config, bundle_count, slot_capacity, measure_time=measure_time
+            )
     elif backend == "torch_ref":
-        kernel_fn = fused_private_update_ref
+        def run_kernel(measure_time: bool = False) -> FusedUpdateOutput:
+            return fused_private_update_ref(
+                state_dict, config, bundle_count, slot_capacity, device, measure_time=measure_time
+            )
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
     # Warmup
     for _ in range(num_warmup):
-        _ = kernel_fn(state_dict, config, bundle_count, slot_capacity, device, measure_time=False)
+        _ = run_kernel(measure_time=False)
     torch.cuda.synchronize()
 
     # Measure
@@ -66,10 +80,12 @@ def benchmark_kernel(
     for _ in range(num_iterations):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        _ = kernel_fn(state_dict, config, bundle_count, slot_capacity, device, measure_time=False)
+        _ = run_kernel(measure_time=False)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # ms
+
+    measured_output = run_kernel(measure_time=True)
 
     # Compute statistics
     times_tensor = torch.tensor(times)
@@ -88,6 +104,10 @@ def benchmark_kernel(
         "median_ms": float(times_tensor.median().item()),
         "p95_ms": float(torch.quantile(times_tensor, 0.95).item()),
         "p99_ms": float(torch.quantile(times_tensor, 0.99).item()),
+        "kernel_launch_count": measured_output.metadata.get("kernel_launch_count", 0),
+        "fused_operator_ms": measured_output.metadata.get("fused_operator_ms", 0.0),
+        "quant_stat_ms": measured_output.metadata.get("quant_stat_ms", 0.0),
+        "noise_bytes": measured_output.metadata.get("noise_bytes", 0),
     }
 
     # Compute bandwidth
@@ -160,6 +180,15 @@ def benchmark_scaling(
             verbose=verbose,
         )
 
+        # Benchmark fused Triton
+        triton_v2_result = benchmark_kernel(
+            state_dict, config, bundle_count,
+            num_warmup=num_warmup,
+            num_iterations=num_iterations,
+            backend="triton_v2",
+            verbose=verbose,
+        )
+
         # Benchmark PyTorch reference
         ref_result = benchmark_kernel(
             state_dict, config, bundle_count,
@@ -172,20 +201,25 @@ def benchmark_scaling(
         # Compute speedup
         if ref_result.get("mean_ms", 0) > 0:
             speedup = ref_result["mean_ms"] / triton_result["mean_ms"]
+            v2_speedup = ref_result["mean_ms"] / triton_v2_result["mean_ms"]
         else:
             speedup = 0.0
+            v2_speedup = 0.0
 
         result = {
             "model": model_type,
             "num_params": num_params,
             "triton": triton_result,
+            "triton_v2": triton_v2_result,
             "torch_ref": ref_result,
             "speedup": speedup,
+            "v2_speedup": v2_speedup,
         }
         results.append(result)
 
         if verbose:
             print(f"\n  Speedup: {speedup:.2f}x")
+            print(f"  V2 speedup: {v2_speedup:.2f}x")
 
     return results
 
@@ -225,6 +259,13 @@ def benchmark_configurations(
             backend="triton",
             verbose=verbose,
         )
+        triton_v2_result = benchmark_kernel(
+            state_dict, config, bundle_count,
+            num_warmup=num_warmup,
+            num_iterations=num_iterations,
+            backend="triton_v2",
+            verbose=verbose,
+        )
 
         result = {
             "config_index": i,
@@ -232,6 +273,7 @@ def benchmark_configurations(
             "noise_multiplier": config.noise_multiplier,
             "quant_bits": config.quant_bits,
             "triton": triton_result,
+            "triton_v2": triton_v2_result,
         }
         results.append(result)
 

@@ -38,6 +38,30 @@ def main():
         help="Specific model to benchmark (default: all)",
     )
     parser.add_argument(
+        "--synthetic-params",
+        type=int,
+        default=None,
+        help="Benchmark a synthetic flat update with this many parameters",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["triton", "triton_v2", "torch_ref"],
+        default="triton_v2",
+        help="Backend for single-model benchmark mode",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+        help="Warmup iterations for benchmark mode",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=100,
+        help="Measurement iterations for benchmark mode",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -82,27 +106,37 @@ def main():
         print("BENCHMARK")
         print("="*60)
 
-        if args.model:
+        if args.model or args.synthetic_params is not None:
             # Single model benchmark
             from fpu.validate import create_test_state_dict
             from fpu.benchmark import benchmark_kernel
             from fpu.types import FusedUpdateConfig
 
-            state_dict = create_test_state_dict(args.model)
+            if args.synthetic_params is not None:
+                if args.synthetic_params < 0:
+                    raise ValueError("--synthetic-params must be non-negative")
+                gen = torch.Generator()
+                gen.manual_seed(2026)
+                state_dict = {"flat": torch.randn(args.synthetic_params, generator=gen)}
+                model_name = f"synthetic_{args.synthetic_params}"
+            else:
+                state_dict = create_test_state_dict(args.model)
+                model_name = args.model
+
             num_params = sum(t.numel() for t in state_dict.values())
             bundle_count = (num_params + 4095) // 4096
 
-            config = FusedUpdateConfig(clip_norm=1.0, noise_multiplier=0.1)
+            config = FusedUpdateConfig(clip_norm=1.0, noise_multiplier=0.1, quant_bits=8)
             results = benchmark_kernel(
                 state_dict, config, bundle_count,
-                num_warmup=10, num_iterations=100,
-                backend="triton", verbose=True,
+                num_warmup=args.warmup, num_iterations=args.iterations,
+                backend=args.backend, verbose=True,
             )
 
             # Save results
             output_dir = Path(args.output)
             output_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"benchmark_{args.model}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            filename = f"benchmark_{model_name}_{args.backend}_{time.strftime('%Y%m%d_%H%M%S')}.json"
             with open(output_dir / filename, "w") as f:
                 json.dump(results, f, indent=2)
             print(f"\nResults saved to: {output_dir / filename}")
