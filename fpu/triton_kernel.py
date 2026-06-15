@@ -67,6 +67,31 @@ def _l2_norm_partial_kernel(
 
 
 @triton.jit
+def _l2_norm_abs_max_partial_kernel(
+    x_ptr,
+    partial_sums_ptr,
+    partial_max_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Pass 1 variant for quantized no-noise runs: compute both L2 partial sums
+    and raw abs-max partials while the input is already being streamed.
+    """
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_sum = tl.sum(x * x, axis=0)
+    block_max = tl.max(tl.abs(x), axis=0)
+
+    tl.store(partial_sums_ptr + pid, block_sum)
+    tl.store(partial_max_ptr + pid, block_max)
+
+
+@triton.jit
 def _l2_norm_reduce_kernel(
     partial_sums_ptr,
     out_ptr,
@@ -83,6 +108,48 @@ def _l2_norm_reduce_kernel(
     partial = tl.load(partial_sums_ptr + offsets, mask=mask, other=0.0)
     total = tl.sum(partial, axis=0)
     tl.store(out_ptr, total)
+
+
+@triton.jit
+def _sum_max_reduce_blocks_kernel(
+    partial_sums_ptr,
+    partial_max_ptr,
+    next_sums_ptr,
+    next_max_ptr,
+    num_blocks,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Reduce sum and max partial buffers together."""
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = offsets < num_blocks
+
+    partial_sum = tl.load(partial_sums_ptr + offsets, mask=mask, other=0.0)
+    partial_max = tl.load(partial_max_ptr + offsets, mask=mask, other=0.0)
+
+    tl.store(next_sums_ptr + pid, tl.sum(partial_sum, axis=0))
+    tl.store(next_max_ptr + pid, tl.max(partial_max, axis=0))
+
+
+@triton.jit
+def _l2_norm_abs_max_reduce_kernel(
+    partial_sums_ptr,
+    partial_max_ptr,
+    sum_out_ptr,
+    max_out_ptr,
+    num_blocks,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Final single-program reduction for L2 sum and raw abs max."""
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = offsets < num_blocks
+
+    partial_sum = tl.load(partial_sums_ptr + offsets, mask=mask, other=0.0)
+    partial_max = tl.load(partial_max_ptr + offsets, mask=mask, other=0.0)
+
+    tl.store(sum_out_ptr, tl.sum(partial_sum, axis=0))
+    tl.store(max_out_ptr, tl.max(partial_max, axis=0))
 
 
 @triton.jit
@@ -360,11 +427,13 @@ def _fused_update_kernel(
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
-    # Padding slots are already zero-initialized by the output allocation.
-    mask = offsets < num_params
+    param_mask = offsets < num_params
+    store_mask = offsets < total_slots
+    safe_offsets = tl.minimum(offsets, num_params - 1)
 
-    # Load flat values (0 for padding)
-    x = tl.load(flat_ptr + offsets, mask=mask, other=0.0)
+    # Load flat values and synthesize zero-valued padding lanes. This lets the
+    # kernel initialize the tail slots without a separate full-buffer zero pass.
+    x = tl.load(flat_ptr + safe_offsets, mask=param_mask, other=0.0)
 
     # Apply clip_scale * client_weight
     combined_scale = clip_scale * client_weight
@@ -372,7 +441,7 @@ def _fused_update_kernel(
 
     # Add noise if enabled
     if noise_std > 0:
-        noise = tl.load(noise_ptr + offsets, mask=mask, other=0.0)
+        noise = tl.load(noise_ptr + safe_offsets, mask=param_mask, other=0.0)
         x = x + noise * noise_std
 
     # Quantize if enabled
@@ -387,7 +456,63 @@ def _fused_update_kernel(
     dest = bundle_ids * slot_capacity + slot_offsets
 
     # Store to packed buffer
-    tl.store(packed_ptr + dest, x, mask=mask)
+    tl.store(packed_ptr + dest, x, mask=store_mask)
+
+
+@triton.jit
+def _fused_update_int8_kernel(
+    # Input
+    flat_ptr,
+    noise_ptr,
+    # Output
+    packed_ptr,
+    # Pre-computed scalars
+    clip_scale,
+    client_weight,
+    noise_std,
+    # Quantization params
+    quant_inv_scale,
+    qmin,
+    qmax,
+    # Dimensions
+    num_params,
+    total_slots,
+    slot_capacity,
+    # Kernel config
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused clip + scale + noise + int8 quant + pack.
+
+    Unlike _fused_update_kernel, this stores the quantized integer payload
+    directly. Padding slots are written as zero.
+    """
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+
+    param_mask = offsets < num_params
+    store_mask = offsets < total_slots
+    safe_offsets = tl.minimum(offsets, num_params - 1)
+
+    x = tl.load(flat_ptr + safe_offsets, mask=param_mask, other=0.0)
+    x = x * (clip_scale * client_weight)
+
+    if noise_std > 0:
+        noise = tl.load(noise_ptr + safe_offsets, mask=param_mask, other=0.0)
+        x = x + noise * noise_std
+
+    scaled = x * quant_inv_scale
+    quantized = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.round(scaled), qmin), qmax)
+    quantized = tl.where(param_mask, quantized, 0.0)
+
+    bundle_ids = offsets // slot_capacity
+    slot_offsets = offsets % slot_capacity
+    dest = bundle_ids * slot_capacity + slot_offsets
+
+    # Cast to physical int8 for compressed output
+    quantized_i8 = quantized.to(tl.int8)
+    tl.store(packed_ptr + dest, quantized_i8, mask=store_mask)
 
 
 # ============================================================================
@@ -449,6 +574,67 @@ def compute_l2_norm_triton(flat: torch.Tensor) -> float:
 
     # Compute final norm on CPU
     return math.sqrt(float(sum_sq.item()))
+
+
+def compute_l2_norm_and_abs_max_triton(flat: torch.Tensor) -> Tuple[float, float]:
+    """Compute L2 norm and raw abs max in one streamed pass.
+
+    This is useful for quantized runs without DP noise. The quantization scale
+    needs abs(max(flat * scalar)); because clipping and client weighting are
+    scalar transforms in that case, the raw abs max can be reused after the L2
+    norm determines the clipping scale.
+    """
+    n_elements = flat.numel()
+    if n_elements == 0:
+        return 0.0, 0.0
+
+    num_blocks = triton.cdiv(n_elements, L2_BLOCK_SIZE)
+    partial_sums = torch.empty(num_blocks, dtype=torch.float32, device=flat.device)
+    partial_max = torch.empty(num_blocks, dtype=torch.float32, device=flat.device)
+
+    _l2_norm_abs_max_partial_kernel[(num_blocks,)](
+        flat,
+        partial_sums,
+        partial_max,
+        n_elements,
+        BLOCK_SIZE=L2_BLOCK_SIZE,
+    )
+
+    current_sums = partial_sums
+    current_max = partial_max
+    current_blocks = num_blocks
+    while current_blocks > MAX_REDUCE_BLOCK_SIZE:
+        next_blocks = triton.cdiv(current_blocks, MAX_REDUCE_BLOCK_SIZE)
+        next_sums = torch.empty(next_blocks, dtype=torch.float32, device=flat.device)
+        next_max = torch.empty(next_blocks, dtype=torch.float32, device=flat.device)
+        _sum_max_reduce_blocks_kernel[(next_blocks,)](
+            current_sums,
+            current_max,
+            next_sums,
+            next_max,
+            current_blocks,
+            BLOCK_SIZE=MAX_REDUCE_BLOCK_SIZE,
+        )
+        current_sums = next_sums
+        current_max = next_max
+        current_blocks = next_blocks
+
+    reduce_block = 1
+    while reduce_block < current_blocks:
+        reduce_block *= 2
+
+    sum_sq = torch.empty(1, dtype=torch.float32, device=flat.device)
+    raw_abs_max = torch.empty(1, dtype=torch.float32, device=flat.device)
+    _l2_norm_abs_max_reduce_kernel[(1,)](
+        current_sums,
+        current_max,
+        sum_sq,
+        raw_abs_max,
+        current_blocks,
+        BLOCK_SIZE=reduce_block,
+    )
+
+    return math.sqrt(float(sum_sq.item())), float(raw_abs_max.item())
 
 
 def _l2_norm_launch_count(n_elements: int) -> int:
@@ -588,6 +774,9 @@ def fused_private_update_triton(
     num_params = flat.numel()
     total_slots = validate_fused_update_args(config, bundle_count, slot_capacity, num_params)
     metrics.input_bytes = flat.numel() * flat.element_size()
+    metrics.logical_quantized_payload_bytes = (
+        (num_params * config.quant_bits + 7) // 8 if config.quant_bits > 0 else 0
+    )
     metrics.kernel_launch_count = _l2_norm_launch_count(num_params)
 
     if measure_time:
@@ -702,6 +891,7 @@ def fused_private_update_triton(
 
     packed = packed.reshape(bundle_count, slot_capacity)
     metrics.output_bytes = packed.numel() * packed.element_size()
+    metrics.output_dtype = str(packed.dtype).replace("torch.", "")
 
     if measure_time:
         torch.cuda.synchronize(device)
@@ -773,10 +963,21 @@ def fused_private_update_triton_v2(
     num_params = flat.numel()
     total_slots = validate_fused_update_args(config, bundle_count, slot_capacity, num_params)
     metrics.input_bytes = flat.numel() * flat.element_size()
+    metrics.logical_quantized_payload_bytes = (
+        (num_params * config.quant_bits + 7) // 8 if config.quant_bits > 0 else 0
+    )
     metrics.kernel_launch_count = _l2_norm_launch_count(num_params)
 
-    # Step 1: Compute L2 norm (two-pass Triton reduction)
-    l2_norm = compute_l2_norm_triton(flat)
+    use_quant = config.quant_bits > 0
+    can_fold_quant_stat = use_quant and config.noise_multiplier <= 0
+
+    # Step 1: Compute L2 norm. Quantized no-noise runs also need abs-max; fold
+    # that stat into the L2 pass so the input is not streamed twice.
+    if can_fold_quant_stat:
+        l2_norm, raw_abs_max = compute_l2_norm_and_abs_max_triton(flat)
+    else:
+        l2_norm = compute_l2_norm_triton(flat)
+        raw_abs_max = 0.0
     metrics.l2_norm = l2_norm
 
     # Compute clip scale on host
@@ -832,7 +1033,6 @@ def fused_private_update_triton_v2(
         metrics.noise_ms = (t_noise1 - t_noise0) * 1000
 
     # Prepare quantization params
-    use_quant = config.quant_bits > 0
     quant_scale = 1.0
     quant_inv_scale = 1.0
     qmin = 0
@@ -841,72 +1041,125 @@ def fused_private_update_triton_v2(
         qmin = -(2 ** (config.quant_bits - 1))
         qmax_val = 2 ** (config.quant_bits - 1) - 1
         if num_params > 0:
-            if measure_time:
-                torch.cuda.synchronize(device)
-                t_stat0 = time.perf_counter()
-            abs_max_val = compute_transformed_abs_max_triton(
-                flat,
-                noise_buffer,
-                num_params,
-                clip_scale,
-                config.client_weight,
-                noise_std,
-            )
-            metrics.kernel_launch_count += _stat_reduce_launch_count(num_params)
+            if can_fold_quant_stat:
+                abs_max_val = raw_abs_max * abs(clip_scale * config.client_weight)
+                metrics.quant_stat_source = "l2_abs_max"
+            else:
+                if measure_time:
+                    torch.cuda.synchronize(device)
+                    t_stat0 = time.perf_counter()
+                abs_max_val = compute_transformed_abs_max_triton(
+                    flat,
+                    noise_buffer,
+                    num_params,
+                    clip_scale,
+                    config.client_weight,
+                    noise_std,
+                )
+                metrics.kernel_launch_count += _stat_reduce_launch_count(num_params)
+                metrics.quant_stat_source = "transformed_abs_max"
+                if measure_time:
+                    torch.cuda.synchronize(device)
+                    t_stat1 = time.perf_counter()
+                    metrics.quant_stat_ms = (t_stat1 - t_stat0) * 1000
             metrics.quant_abs_max = abs_max_val
             if abs_max_val > 1e-8:
                 quant_scale = abs_max_val / qmax_val
                 quant_inv_scale = 1.0 / quant_scale
                 metrics.quant_scale = quant_scale
-            if measure_time:
-                torch.cuda.synchronize(device)
-                t_stat1 = time.perf_counter()
-                metrics.quant_stat_ms = (t_stat1 - t_stat0) * 1000
+        else:
+            metrics.quant_stat_source = "empty"
 
     if measure_time:
         torch.cuda.synchronize(device)
         t2 = time.perf_counter()
 
-    # Step 2: Fused kernel — clip + scale + noise + quant + pack
-    if packed_out is None:
-        packed = torch.zeros(total_slots, dtype=torch.float32, device=device)
-    else:
-        if not packed_out.is_cuda or packed_out.device != device:
-            raise ValueError("packed_out must be a CUDA tensor on the same device as flat")
-        if packed_out.dtype != torch.float32:
-            raise ValueError(f"packed_out must be float32, got {packed_out.dtype}")
-        if not packed_out.is_contiguous():
-            raise ValueError("packed_out must be contiguous")
-        if packed_out.numel() != total_slots:
-            raise ValueError(
-                f"packed_out has {packed_out.numel()} elements but {total_slots} are required"
-            )
-        packed = packed_out.reshape(-1)
-        packed.zero_()
+    # Step 2: Fused kernel — clip + scale + noise + quant + pack. The kernel
+    # writes zero padding lanes, so callers do not pay for a full packed.zero_().
+    use_physical_int8 = config.physical_quantized_output and config.quant_bits == 8
 
-    if total_slots > 0 and num_params > 0:
-        grid = (triton.cdiv(num_params, BLOCK_SIZE),)
-        _fused_update_kernel[grid](
-            flat,
-            noise_buffer,
-            packed,
-            clip_scale,
-            config.client_weight,
-            noise_std,
-            quant_inv_scale,
-            quant_scale,
-            qmin,
-            qmax_val,
-            use_quant,
-            num_params,
-            total_slots,
-            slot_capacity,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-        metrics.kernel_launch_count += 1
+    if use_physical_int8:
+        # Physical int8 output: allocate int8 buffer, use int8 kernel
+        if packed_out is None:
+            packed = torch.empty(total_slots, dtype=torch.int8, device=device)
+        else:
+            if not packed_out.is_cuda or packed_out.device != device:
+                raise ValueError("packed_out must be a CUDA tensor on the same device as flat")
+            if packed_out.dtype != torch.int8:
+                raise ValueError(
+                    f"packed_out must be int8 for physical_quantized_output, got {packed_out.dtype}"
+                )
+            if not packed_out.is_contiguous():
+                raise ValueError("packed_out must be contiguous")
+            if packed_out.numel() != total_slots:
+                raise ValueError(
+                    f"packed_out has {packed_out.numel()} elements but {total_slots} are required"
+                )
+            packed = packed_out.reshape(-1)
+    else:
+        # Standard float32 CKKS-ready slot output
+        if packed_out is None:
+            packed = torch.empty(total_slots, dtype=torch.float32, device=device)
+        else:
+            if not packed_out.is_cuda or packed_out.device != device:
+                raise ValueError("packed_out must be a CUDA tensor on the same device as flat")
+            if packed_out.dtype != torch.float32:
+                raise ValueError(f"packed_out must be float32, got {packed_out.dtype}")
+            if not packed_out.is_contiguous():
+                raise ValueError("packed_out must be contiguous")
+            if packed_out.numel() != total_slots:
+                raise ValueError(
+                    f"packed_out has {packed_out.numel()} elements but {total_slots} are required"
+                )
+            packed = packed_out.reshape(-1)
+
+    if total_slots > 0:
+        if num_params > 0:
+            grid = (triton.cdiv(total_slots, BLOCK_SIZE),)
+            if use_physical_int8:
+                # Int8 kernel stores quantized integers directly as int8
+                _fused_update_int8_kernel[grid](
+                    flat,
+                    noise_buffer,
+                    packed,
+                    clip_scale,
+                    config.client_weight,
+                    noise_std,
+                    quant_inv_scale,
+                    qmin,
+                    qmax_val,
+                    num_params,
+                    total_slots,
+                    slot_capacity,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                )
+            else:
+                _fused_update_kernel[grid](
+                    flat,
+                    noise_buffer,
+                    packed,
+                    clip_scale,
+                    config.client_weight,
+                    noise_std,
+                    quant_inv_scale,
+                    quant_scale,
+                    qmin,
+                    qmax_val,
+                    use_quant,
+                    num_params,
+                    total_slots,
+                    slot_capacity,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                )
+            metrics.kernel_launch_count += 1
+        else:
+            packed.zero_()
 
     packed = packed.reshape(bundle_count, slot_capacity)
     metrics.output_bytes = packed.numel() * packed.element_size()
+    metrics.output_dtype = str(packed.dtype).replace("torch.", "")
+    if use_physical_int8:
+        metrics.output_format = "int8_quantized"
 
     if measure_time:
         torch.cuda.synchronize(device)
@@ -928,7 +1181,13 @@ def fused_private_update_triton_v2(
             "noise_source": noise_source,
             "quant_abs_max": metrics.quant_abs_max,
             "quant_scale": metrics.quant_scale,
+            "quant_stat_source": metrics.quant_stat_source,
             "kernel_launch_count": metrics.kernel_launch_count,
             "backend": metrics.backend,
+            "input_bytes": metrics.input_bytes,
+            "output_bytes": metrics.output_bytes,
+            "output_dtype": metrics.output_dtype,
+            "output_format": metrics.output_format,
+            "logical_quantized_payload_bytes": metrics.logical_quantized_payload_bytes,
         },
     )

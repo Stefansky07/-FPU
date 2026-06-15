@@ -6,6 +6,7 @@ Usage:
     python run_benchmark.py --mode benchmark --output results/
     python run_benchmark.py --mode validate
     python run_benchmark.py --mode both --output results/
+    python run_benchmark.py --mode benchmark --synthetic-params 1000000 --physical-quant-output
 """
 
 import argparse
@@ -52,14 +53,14 @@ def main():
     parser.add_argument(
         "--warmup",
         type=int,
-        default=10,
-        help="Warmup iterations for benchmark mode",
+        default=20,
+        help="Warmup iterations for benchmark mode (default: 20)",
     )
     parser.add_argument(
         "--iterations",
         type=int,
         default=100,
-        help="Measurement iterations for benchmark mode",
+        help="Measurement iterations for benchmark mode (default: 100)",
     )
     parser.add_argument(
         "--clip-norm",
@@ -86,9 +87,25 @@ def main():
         help="Client weight for single-model benchmark mode",
     )
     parser.add_argument(
+        "--physical-quant-output",
+        action="store_true",
+        help="Enable physical int8 quantized output (requires --quant-bits 8)",
+    )
+    parser.add_argument(
         "--reuse-buffers",
         action="store_true",
         help="Reuse triton_v2 output/noise buffers across benchmark iterations",
+    )
+    parser.add_argument(
+        "--lock-clocks",
+        action="store_true",
+        help="Attempt to lock GPU clocks for stable benchmark (needs admin)",
+    )
+    parser.add_argument(
+        "--slot-capacity",
+        type=int,
+        default=4096,
+        help="Slot capacity (default: 4096)",
     )
     parser.add_argument(
         "--verbose",
@@ -116,13 +133,24 @@ def main():
 
     # Import FPU
     from fpu.validate import run_validation_suite
-    from fpu.benchmark import run_full_benchmark, benchmark_scaling
+    from fpu.benchmark import (
+        run_full_benchmark,
+        benchmark_kernel,
+        get_gpu_environment,
+    )
+
+    # Print GPU environment
+    gpu_env = get_gpu_environment()
+    print("GPU Environment:")
+    for k, v in gpu_env.items():
+        print(f"  {k}: {v}")
+    print()
 
     # Run validation
     if args.mode in ["validate", "both"]:
-        print("="*60)
+        print("=" * 60)
         print("VALIDATION")
-        print("="*60)
+        print("=" * 60)
         passed = run_validation_suite(verbose=args.verbose)
         if not passed:
             print("\nVALIDATION FAILED!")
@@ -131,14 +159,13 @@ def main():
 
     # Run benchmarks
     if args.mode in ["benchmark", "both"]:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("BENCHMARK")
-        print("="*60)
+        print("=" * 60)
 
         if args.model or args.synthetic_params is not None:
             # Single model benchmark
             from fpu.validate import create_test_state_dict
-            from fpu.benchmark import benchmark_kernel
             from fpu.types import FusedUpdateConfig
 
             if args.synthetic_params is not None:
@@ -153,31 +180,48 @@ def main():
                 model_name = args.model
 
             num_params = sum(t.numel() for t in state_dict.values())
-            bundle_count = (num_params + 4095) // 4096
+            bundle_count = (num_params + args.slot_capacity - 1) // args.slot_capacity
 
             config = FusedUpdateConfig(
                 clip_norm=args.clip_norm,
                 noise_multiplier=args.noise_multiplier,
                 quant_bits=args.quant_bits,
                 client_weight=args.client_weight,
+                physical_quantized_output=args.physical_quant_output,
             )
             results = benchmark_kernel(
                 state_dict, config, bundle_count,
-                num_warmup=args.warmup, num_iterations=args.iterations,
-                backend=args.backend, reuse_buffers=args.reuse_buffers, verbose=True,
+                slot_capacity=args.slot_capacity,
+                num_warmup=args.warmup,
+                num_iterations=args.iterations,
+                backend=args.backend,
+                reuse_buffers=args.reuse_buffers,
+                lock_clocks=args.lock_clocks,
+                verbose=True,
             )
 
             # Save results
             output_dir = Path(args.output)
             output_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"benchmark_{model_name}_{args.backend}_{time.strftime('%Y%m%d_%H%M%S')}.json"
-            with open(output_dir / filename, "w") as f:
+            phys = "_physint8" if args.physical_quant_output else ""
+            filename = (
+                f"benchmark_{model_name}_{args.backend}"
+                f"_q{args.quant_bits}{phys}"
+                f"_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            )
+            filepath = output_dir / filename
+            with open(filepath, "w") as f:
                 json.dump(results, f, indent=2)
-            print(f"\nResults saved to: {output_dir / filename}")
+            print(f"\nResults saved to: {filepath}")
 
         else:
             # Full benchmark suite
-            results = run_full_benchmark(output_dir=args.output, verbose=args.verbose)
+            results = run_full_benchmark(
+                output_dir=args.output,
+                num_warmup=args.warmup,
+                num_iterations=args.iterations,
+                verbose=args.verbose,
+            )
 
     print("\nDone!")
 

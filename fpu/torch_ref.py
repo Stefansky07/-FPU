@@ -184,6 +184,9 @@ def fused_private_update_ref(
     num_params = flat.numel()
     validate_fused_update_args(config, bundle_count, slot_capacity, num_params)
     metrics.input_bytes = flat.numel() * flat.element_size()
+    metrics.logical_quantized_payload_bytes = (
+        (num_params * config.quant_bits + 7) // 8 if config.quant_bits > 0 else 0
+    )
 
     if measure_time:
         torch.cuda.synchronize(device)
@@ -229,6 +232,7 @@ def fused_private_update_ref(
     # Step 6: Pack to slots
     packed = pack_to_slots(flat, bundle_count, slot_capacity, num_params)
     metrics.output_bytes = packed.numel() * packed.element_size()
+    metrics.output_dtype = str(packed.dtype).replace("torch.", "")
 
     if measure_time:
         torch.cuda.synchronize(device)

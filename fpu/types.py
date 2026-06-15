@@ -26,6 +26,11 @@ class FusedUpdateConfig:
     # Quantization bits (0 = no quantization, 8 = int8, 16 = int16)
     quant_bits: int = 0
 
+    # Emit physical int8 slots instead of dequantized float32 CKKS slots.
+    # This is an opt-in benchmark/transport path; the default remains float32
+    # for direct CKKS encoding compatibility.
+    physical_quantized_output: bool = False
+
     # Client weight for aggregation
     client_weight: float = 1.0
 
@@ -47,6 +52,13 @@ class FusedUpdateConfig:
             raise TypeError(f"quant_bits must be an integer, got {type(self.quant_bits).__name__}")
         if self.quant_bits < 0 or self.quant_bits == 1 or self.quant_bits >= 32:
             raise ValueError("quant_bits must be 0 or an integer in [2, 31]")
+        if not isinstance(self.physical_quantized_output, bool):
+            raise TypeError(
+                "physical_quantized_output must be a boolean, "
+                f"got {type(self.physical_quantized_output).__name__}"
+            )
+        if self.physical_quantized_output and self.quant_bits != 8:
+            raise ValueError("physical_quantized_output currently requires quant_bits=8")
         if not math.isfinite(self.client_weight):
             raise ValueError(f"client_weight must be finite, got {self.client_weight}")
         if not math.isfinite(self.ckks_scale) or self.ckks_scale <= 0:
@@ -57,6 +69,7 @@ class FusedUpdateConfig:
             "clip_norm": self.clip_norm,
             "noise_multiplier": self.noise_multiplier,
             "quant_bits": self.quant_bits,
+            "physical_quantized_output": self.physical_quantized_output,
             "client_weight": self.client_weight,
             "ckks_scale": self.ckks_scale,
             "noise_seed": self.noise_seed,
@@ -122,6 +135,7 @@ class KernelMetrics:
     noise_std: float = 0.0
     quant_abs_max: float = 0.0
     quant_scale: float = 1.0
+    quant_stat_source: str = "none"
     kernel_launch_count: int = 0
     backend: str = ""
     noise_source: str = "none"
@@ -129,6 +143,9 @@ class KernelMetrics:
     # Memory
     input_bytes: int = 0
     output_bytes: int = 0
+    logical_quantized_payload_bytes: int = 0
+    output_dtype: str = ""
+    output_format: str = "float_slots"
     noise_bytes: int = 0
 
     @property
@@ -153,11 +170,15 @@ class KernelMetrics:
             "noise_std": self.noise_std,
             "quant_abs_max": self.quant_abs_max,
             "quant_scale": self.quant_scale,
+            "quant_stat_source": self.quant_stat_source,
             "kernel_launch_count": self.kernel_launch_count,
             "backend": self.backend,
             "noise_source": self.noise_source,
             "input_bytes": self.input_bytes,
             "output_bytes": self.output_bytes,
+            "logical_quantized_payload_bytes": self.logical_quantized_payload_bytes,
+            "output_dtype": self.output_dtype,
+            "output_format": self.output_format,
             "noise_bytes": self.noise_bytes,
             "bandwidth_gbps": self.bandwidth_gbps,
         }

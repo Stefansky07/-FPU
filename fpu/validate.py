@@ -16,6 +16,7 @@ from .torch_ref import fused_private_update_ref, flatten_state_dict
 try:
     import triton
     from .triton_kernel import (
+        compute_l2_norm_and_abs_max_triton,
         compute_transformed_abs_max_triton,
         fused_private_update_triton,
         fused_private_update_triton_v2,
@@ -233,6 +234,34 @@ def validate_l2_norm(
     return passed
 
 
+def validate_l2_abs_max_fused_stat(
+    flat: torch.Tensor,
+    rtol: float = 1e-5,
+    verbose: bool = True,
+) -> bool:
+    """Validate the combined L2 + abs-max reduction used by no-noise quantization."""
+    if not check_triton_available():
+        return True
+
+    device = torch.device("cuda")
+    flat_gpu = flat.to(device)
+
+    ref_norm = float(torch.linalg.vector_norm(flat_gpu).item())
+    ref_abs_max = float(torch.max(torch.abs(flat_gpu)).item()) if flat_gpu.numel() else 0.0
+    triton_norm, triton_abs_max = compute_l2_norm_and_abs_max_triton(flat_gpu)
+
+    norm_error = abs(ref_norm - triton_norm) / (ref_norm + 1e-8)
+    max_error = abs(ref_abs_max - triton_abs_max) / (ref_abs_max + 1e-8)
+    passed = norm_error < rtol and max_error < rtol
+
+    if verbose:
+        print(f"L2 + abs-max fused stat validation {'PASSED' if passed else 'FAILED'}:")
+        print(f"  L2 relative error: {norm_error:.2e}")
+        print(f"  Abs-max relative error: {max_error:.2e}")
+
+    return passed
+
+
 def validate_edge_cases(verbose: bool = True) -> bool:
     """Validate empty updates and argument checks that should fail fast."""
     if not check_triton_available():
@@ -296,6 +325,59 @@ def validate_edge_cases(verbose: bool = True) -> bool:
             print(f"  {label}: {'PASSED' if passed else 'FAILED'}")
 
     return all_passed
+
+
+def validate_quant_stat_folding(
+    num_params: int = 1_000_000,
+    slot_capacity: int = 4096,
+    verbose: bool = True,
+) -> bool:
+    """Smoke-test that v2 folds no-noise quantization stats into the L2 pass."""
+    if not check_triton_available():
+        return True
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2026)
+
+    flat = torch.randn(num_params, generator=gen, device=device, dtype=torch.float32)
+    bundle_count = (num_params + slot_capacity - 1) // slot_capacity
+    config = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.0,
+        quant_bits=8,
+        client_weight=1.0,
+    )
+
+    output = fused_private_update_triton_v2(
+        flat,
+        config,
+        bundle_count,
+        slot_capacity,
+        measure_time=True,
+    )
+
+    clip_scale = float(output.metadata["clip_scale"])
+    expected_abs_max = float(torch.max(torch.abs(flat)).item()) * abs(clip_scale * config.client_weight)
+    actual_abs_max = float(output.metadata["quant_abs_max"])
+    rel_error = abs(expected_abs_max - actual_abs_max) / (expected_abs_max + 1e-8)
+    padding_ok = True
+    if output.padding_slots > 0:
+        padding_ok = bool(torch.all(output.packed_slots.reshape(-1)[num_params:] == 0).item())
+    source_ok = output.metadata.get("quant_stat_source") == "l2_abs_max"
+    stat_time_ok = float(output.metadata.get("quant_stat_ms", 0.0)) == 0.0
+    passed = rel_error < 1e-5 and padding_ok and source_ok and stat_time_ok
+
+    if verbose:
+        print("\n--- Quant Stat Folding Test ---")
+        print(f"  Params: {num_params:,}")
+        print(f"  Quant stat source: {output.metadata.get('quant_stat_source')}")
+        print(f"  Abs-max relative error: {rel_error:.2e}")
+        print(f"  Quant stat ms: {output.metadata.get('quant_stat_ms', 0.0):.3f}")
+        print(f"  Padding zeroed: {'yes' if padding_ok else 'no'}")
+        print(f"  Result: {'PASSED' if passed else 'FAILED'}")
+
+    return passed
 
 
 def validate_large_scale_readiness(
@@ -376,6 +458,100 @@ def validate_large_scale_readiness(
         print(f"  Abs-max stat relative error: {stat_rel_error:.2e}")
         print(f"  Kernel launches: {output.metadata.get('kernel_launch_count', 0)}")
         print(f"  Noise bytes: {output.metadata.get('noise_bytes', 0):,}")
+        print(f"  Result: {'PASSED' if passed else 'FAILED'}")
+
+    return passed
+
+
+def validate_physical_int8_output(
+    num_params: int = 1_000_000,
+    slot_capacity: int = 4096,
+    verbose: bool = True,
+) -> bool:
+    """Validate that physical_quantized_output=True produces real int8 output.
+
+    This is the critical test for the 12GB vs 3GB output size question.
+    With quant_bits=8 and physical_quantized_output=True, the packed tensor
+    must be int8, and output_bytes must be total_slots * 1 (not * 4).
+    """
+    if not check_triton_available():
+        return True
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2026)
+
+    flat = torch.randn(num_params, generator=gen, device=device, dtype=torch.float32)
+    bundle_count = (num_params + slot_capacity - 1) // slot_capacity
+    total_slots = bundle_count * slot_capacity
+
+    # --- Run float32 path (physical_quantized_output=False) ---
+    config_f32 = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.0,
+        quant_bits=8,
+        client_weight=1.0,
+        physical_quantized_output=False,
+    )
+    out_f32 = fused_private_update_triton_v2(
+        flat, config_f32, bundle_count, slot_capacity, measure_time=True,
+    )
+
+    # --- Run int8 path (physical_quantized_output=True) ---
+    config_i8 = FusedUpdateConfig(
+        clip_norm=1.0,
+        noise_multiplier=0.0,
+        quant_bits=8,
+        client_weight=1.0,
+        physical_quantized_output=True,
+    )
+    out_i8 = fused_private_update_triton_v2(
+        flat, config_i8, bundle_count, slot_capacity, measure_time=True,
+    )
+
+    # --- Checks ---
+    dtype_ok = out_i8.packed_slots.dtype == torch.int8
+    f32_dtype_ok = out_f32.packed_slots.dtype == torch.float32
+
+    actual_bytes_i8 = out_i8.packed_slots.numel() * out_i8.packed_slots.element_size()
+    actual_bytes_f32 = out_f32.packed_slots.numel() * out_f32.packed_slots.element_size()
+    bytes_ratio = actual_bytes_f32 / max(actual_bytes_i8, 1)
+    compression_ok = abs(bytes_ratio - 4.0) < 0.01  # int8 is 4x smaller
+
+    reported_bytes_ok = out_i8.metadata.get("output_bytes", 0) == actual_bytes_i8
+    format_ok = out_i8.metadata.get("output_format") == "int8_quantized"
+
+    # Round-trip correctness: dequantize int8 and compare to float32 path
+    quant_scale_i8 = float(out_i8.metadata.get("quant_scale", 1.0))
+    dequantized = out_i8.packed_slots.float() * quant_scale_i8
+    # The float32 path already did quantize→dequantize, so they should match
+    quant_scale_f32 = float(out_f32.metadata.get("quant_scale", 1.0))
+    max_err = float(torch.max(torch.abs(dequantized - out_f32.packed_slots)).item())
+    # Allow up to 1 quantization step difference due to scale rounding
+    max_allowed_err = max(quant_scale_i8, quant_scale_f32) * 1.01
+    numerics_ok = max_err <= max_allowed_err
+
+    # Padding check: slots beyond num_params should be 0
+    padding_ok = True
+    if out_i8.padding_slots > 0:
+        padding_vals = out_i8.packed_slots.reshape(-1)[num_params:]
+        padding_ok = bool(torch.all(padding_vals == 0).item())
+
+    passed = dtype_ok and f32_dtype_ok and compression_ok and reported_bytes_ok and format_ok and numerics_ok and padding_ok
+
+    if verbose:
+        print("\n--- Physical Int8 Output Test ---")
+        print(f"  Params: {num_params:,}")
+        print(f"  Float32 output:")
+        print(f"    dtype={out_f32.packed_slots.dtype}, bytes={actual_bytes_f32:,}")
+        print(f"    format={out_f32.metadata.get('output_format')}")
+        print(f"  Int8 output:")
+        print(f"    dtype={out_i8.packed_slots.dtype}, bytes={actual_bytes_i8:,}")
+        print(f"    format={out_i8.metadata.get('output_format')}")
+        print(f"  Compression ratio: {bytes_ratio:.2f}x (expect 4.00x)")
+        print(f"  Reported output_bytes matches actual: {'yes' if reported_bytes_ok else 'NO'}")
+        print(f"  Round-trip max error: {max_err:.2e} (allowed: {max_allowed_err:.2e})")
+        print(f"  Padding zeroed: {'yes' if padding_ok else 'NO'}")
         print(f"  Result: {'PASSED' if passed else 'FAILED'}")
 
     return passed
@@ -496,6 +672,8 @@ def run_validation_suite(
     flat = torch.randn(10000)
     if not validate_l2_norm(flat, verbose=verbose):
         all_passed = False
+    if not validate_l2_abs_max_fused_stat(flat, verbose=verbose):
+        all_passed = False
 
     # Test slot packing
     if verbose:
@@ -507,7 +685,13 @@ def run_validation_suite(
     if not validate_edge_cases(verbose=verbose):
         all_passed = False
 
+    if not validate_quant_stat_folding(verbose=verbose):
+        all_passed = False
+
     if not validate_large_scale_readiness(verbose=verbose):
+        all_passed = False
+
+    if not validate_physical_int8_output(verbose=verbose):
         all_passed = False
 
     if verbose:

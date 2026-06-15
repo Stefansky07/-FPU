@@ -137,7 +137,7 @@ from fpu import fused_private_update_triton_v2    # 融合单 kernel Triton（GP
 |------|----------------|---------|
 | `_ref` | 0（纯 PyTorch 算子） | 正确性基线、CPU 回退 |
 | `_triton` | 5（norm + clip + noise + quant + pack） | 逐阶段性能分析与调试 |
-| `_triton_v2` | 2（norm + 融合） | **最大吞吐量，论文报告推荐** |
+| `_triton_v2` | 2 个阶段（reduction + 融合；大张量 reduction 会分层启动） | **最大吞吐量，论文报告推荐** |
 
 `_triton_v2` 接受预展平的 tensor，避免额外拷贝：
 
@@ -156,6 +156,10 @@ output = fused_private_update_triton_v2(flat, config, bundle_count, slot_capacit
 | `utilization` | `float` | 有效参数占槽位总数的比例 |
 | `metadata` | `dict` | 包含 `l2_norm`、`clip_scale`、`noise_std` 及各阶段耗时 |
 
+注意：`quant_bits > 0` 当前语义是先量化再反量化回 float32 CKKS slot buffer，`packed_slots`
+的物理存储仍是 float32。benchmark 会同时报告 `output_storage_mb` 和
+`logical_quantized_payload_mb`，前者用于真实 GPU I/O 带宽估算，后者用于观察理想量化 payload 大小。
+
 ## 验证与基准测试
 
 ```bash
@@ -167,7 +171,16 @@ python run_benchmark.py --mode both --output results/
 
 # 仅测试单个模型
 python run_benchmark.py --mode benchmark --model tiny_cnn --output results/
+
+# 复现实验中的大规模 v2 路径，并复用输出/噪声 buffer
+python run_benchmark.py --mode benchmark --synthetic-params 3000000000 \
+  --backend triton_v2 --clip-norm 1.0 --noise-multiplier 0.0 \
+  --quant-bits 8 --reuse-buffers --warmup 10 --iterations 100 \
+  --output results/
 ```
+
+优化后，无噪声量化路径的 `quant_stat_source` 应为 `l2_abs_max`，`quant_stat_ms`
+应接近 0；如果打开 DP 噪声，则仍会使用 `transformed_abs_max` 统计路径来保证量化尺度正确。
 
 ## 与 hefl_runtime 集成
 
