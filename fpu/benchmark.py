@@ -25,6 +25,7 @@ def benchmark_kernel(
     num_warmup: int = 10,
     num_iterations: int = 100,
     backend: str = "triton",
+    reuse_buffers: bool = False,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -38,6 +39,7 @@ def benchmark_kernel(
         num_warmup: Warmup iterations
         num_iterations: Measurement iterations
         backend: "triton", "triton_v2", or "torch_ref"
+        reuse_buffers: Reuse v2 output/noise buffers across iterations
         verbose: Print results
 
     Returns:
@@ -57,10 +59,30 @@ def benchmark_kernel(
             )
     elif backend == "triton_v2":
         flat_gpu = flatten_state_dict(state_dict).to(device)
+        packed_out = None
+        noise_buffer = None
+        if reuse_buffers:
+            total_slots = bundle_count * slot_capacity
+            packed_out = torch.empty(total_slots, dtype=torch.float32, device=device)
+            if config.noise_multiplier > 0:
+                if config.noise_seed is not None:
+                    gen = torch.Generator(device=device)
+                    gen.manual_seed(config.noise_seed)
+                    noise_buffer = torch.randn(
+                        flat_gpu.numel(), generator=gen, device=device, dtype=torch.float32
+                    )
+                else:
+                    noise_buffer = torch.randn(flat_gpu.numel(), device=device, dtype=torch.float32)
 
         def run_kernel(measure_time: bool = False) -> FusedUpdateOutput:
             return fused_private_update_triton_v2(
-                flat_gpu, config, bundle_count, slot_capacity, measure_time=measure_time
+                flat_gpu,
+                config,
+                bundle_count,
+                slot_capacity,
+                measure_time=measure_time,
+                noise=noise_buffer,
+                packed_out=packed_out,
             )
     elif backend == "torch_ref":
         def run_kernel(measure_time: bool = False) -> FusedUpdateOutput:
@@ -97,6 +119,7 @@ def benchmark_kernel(
         "noise_multiplier": config.noise_multiplier,
         "quant_bits": config.quant_bits,
         "client_weight": config.client_weight,
+        "reuse_buffers": reuse_buffers,
         "num_params": num_params,
         "bundle_count": bundle_count,
         "slot_capacity": slot_capacity,
@@ -112,6 +135,7 @@ def benchmark_kernel(
         "fused_operator_ms": measured_output.metadata.get("fused_operator_ms", 0.0),
         "quant_stat_ms": measured_output.metadata.get("quant_stat_ms", 0.0),
         "noise_bytes": measured_output.metadata.get("noise_bytes", 0),
+        "noise_source": measured_output.metadata.get("noise_source", ""),
     }
 
     # Compute bandwidth

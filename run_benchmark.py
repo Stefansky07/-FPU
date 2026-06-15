@@ -86,6 +86,11 @@ def main():
         help="Client weight for single-model benchmark mode",
     )
     parser.add_argument(
+        "--reuse-buffers",
+        action="store_true",
+        help="Reuse triton_v2 output/noise buffers across benchmark iterations",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -159,7 +164,7 @@ def main():
             results = benchmark_kernel(
                 state_dict, config, bundle_count,
                 num_warmup=args.warmup, num_iterations=args.iterations,
-                backend=args.backend, verbose=True,
+                backend=args.backend, reuse_buffers=args.reuse_buffers, verbose=True,
             )
 
             # Save results
